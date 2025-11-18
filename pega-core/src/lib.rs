@@ -17,6 +17,11 @@ pub struct KVCacheRegistration {
     pub size_bytes: usize,
     pub num_blocks: usize,
     pub bytes_per_block: usize,
+    /// Distance in bytes between K and V segments when KV-first layout is used.
+    /// Zero when the layout stores a single segment per block.
+    pub kv_stride_bytes: usize,
+    /// Number of segments per block (1 for blocks-first, 2 for KV-first).
+    pub segments: usize,
 }
 
 #[derive(Clone)]
@@ -50,8 +55,10 @@ impl PegaEngine {
         size_bytes: usize,
         num_blocks: usize,
         bytes_per_block: usize,
+        kv_stride_bytes: usize,
+        segments: usize,
     ) {
-        if bytes_per_block == 0 || num_blocks == 0 {
+        if bytes_per_block == 0 || num_blocks == 0 || segments == 0 {
             panic!("Invalid KV cache layout for layer {}", layer_name);
         }
 
@@ -60,6 +67,8 @@ impl PegaEngine {
             size_bytes,
             num_blocks,
             bytes_per_block,
+            kv_stride_bytes,
+            segments,
         };
 
         self.kv_caches.insert(layer_name, registration);
@@ -109,24 +118,24 @@ impl PegaEngine {
                 ));
             }
 
-            let offset = block_idx
-                .checked_mul(registration.bytes_per_block)
-                .ok_or_else(|| "Block offset overflow".to_string())?;
-
-            if offset + registration.bytes_per_block > registration.size_bytes {
-                return Err(format!(
-                    "Block {} exceeds registered memory for layer {}",
-                    block_idx, layer_name
-                ));
+            // Copy each segment (K/V) for this block
+            let mut combined = Vec::with_capacity(
+                registration
+                    .bytes_per_block
+                    .checked_mul(registration.segments)
+                    .ok_or_else(|| "Block size overflow".to_string())?,
+            );
+            for segment_idx in 0..registration.segments {
+                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
+                let mut buffer = vec![0u8; registration.bytes_per_block];
+                self.copy_gpu_to_cpu(
+                    registration.data_ptr,
+                    offset,
+                    &mut buffer,
+                    registration.bytes_per_block,
+                )?;
+                combined.extend_from_slice(&buffer);
             }
-
-            let mut buffer = vec![0u8; registration.bytes_per_block];
-            self.copy_gpu_to_cpu(
-                registration.data_ptr,
-                offset,
-                &mut buffer,
-                registration.bytes_per_block,
-            )?;
 
             if self
                 .kv_storage
@@ -138,7 +147,7 @@ impl PegaEngine {
             info!("insert key {}-{:?} to kv_storage", layer_name, block_hash);
 
             self.kv_storage
-                .insert((layer_name.clone(), block_hash), Block { data: buffer });
+                .insert((layer_name.clone(), block_hash), Block { data: combined });
         }
 
         Ok(())
@@ -268,35 +277,71 @@ impl PegaEngine {
                 return Err(format!("Missing KV block for layer {}", layer_name));
             };
 
-            if block.data.len() != registration.bytes_per_block {
+            let expected_size = registration
+                .bytes_per_block
+                .checked_mul(registration.segments)
+                .ok_or_else(|| "Stored block size overflow".to_string())?;
+            if block.data.len() != expected_size {
                 return Err(format!(
                     "Stored block size mismatch for layer {}: {} vs {}",
                     layer_name,
                     block.data.len(),
-                    registration.bytes_per_block
+                    expected_size
                 ));
             }
 
-            let offset = block_idx
-                .checked_mul(registration.bytes_per_block)
-                .ok_or_else(|| "Block offset overflow".to_string())?;
-
-            if offset + registration.bytes_per_block > registration.size_bytes {
-                return Err(format!(
-                    "Block {} exceeds registered memory for layer {}",
-                    block_idx, layer_name
-                ));
+            for segment_idx in 0..registration.segments {
+                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
+                let start = segment_idx * registration.bytes_per_block;
+                let end = start + registration.bytes_per_block;
+                let segment = &block.data[start..end];
+                self.copy_cpu_to_gpu(
+                    registration.data_ptr,
+                    offset,
+                    segment,
+                    registration.bytes_per_block,
+                )?;
             }
-
-            self.copy_cpu_to_gpu(
-                registration.data_ptr,
-                offset,
-                &block.data,
-                registration.bytes_per_block,
-            )?;
         }
 
         Ok(())
+    }
+
+    /// Calculate the byte offset for a given block/segment combination.
+    fn segment_offset(
+        &self,
+        registration: &KVCacheRegistration,
+        block_idx: usize,
+        segment_idx: usize,
+    ) -> Result<usize, String> {
+        if segment_idx >= registration.segments {
+            return Err("Segment index out of range".to_string());
+        }
+
+        let base = block_idx
+            .checked_mul(registration.bytes_per_block)
+            .ok_or_else(|| "Block offset overflow".to_string())?;
+
+        let segment_offset = segment_idx
+            .checked_mul(registration.kv_stride_bytes)
+            .ok_or_else(|| "Segment offset overflow".to_string())?;
+
+        let offset = base
+            .checked_add(segment_offset)
+            .ok_or_else(|| "Combined offset overflow".to_string())?;
+
+        if offset + registration.bytes_per_block > registration.size_bytes {
+            return Err(format!(
+                "Block {} segment {} exceeds registered memory (offset {}, size {}, limit {})",
+                block_idx,
+                segment_idx,
+                offset,
+                registration.bytes_per_block,
+                registration.size_bytes
+            ));
+        }
+
+        Ok(offset)
     }
 
     /// Copy data from CPU to GPU

@@ -79,7 +79,7 @@ def main():
     print("✓ Model loaded successfully!")
 
     # Test prompt - use the same prompt twice
-    prompt = "Hello, how are u today? I'm fine, thank you. And you?"
+    prompt = "Hello, how are u today? I'm fine, thank you. And you? Ha ha ha"
 
     # Sampling parameters - use temperature=0 for deterministic output
     sampling_params = SamplingParams(

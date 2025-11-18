@@ -387,15 +387,21 @@ class PegaKVConnector(KVConnectorBase_V1):
             return (0, False)
 
         available_tokens = min(matched_blocks * self._block_size, num_tokens)
-        if available_tokens <= 1:
+        if available_tokens <= 0:
             return (0, False)
 
-        max_cacheable_tokens = available_tokens - 1  # Leave last token for GPU
-        num_new_tokens = max_cacheable_tokens - num_computed_tokens
+        num_new_tokens = available_tokens - num_computed_tokens
 
         if num_new_tokens <= 0:
             print(f"[PegaKVConnector] Request {req_id}: All available cached tokens already consumed")
             return (0, False)
+
+        print(
+            f"[PegaKVConnector] get_num_new_matched_tokens: "
+            f"req={req_id}, prompt_tokens={num_tokens}, computed={num_computed_tokens}, "
+            f"block_size={self._block_size}, hashes={len(block_hashes)}, "
+            f"matched_blocks={matched_blocks}, reuse_tokens={num_new_tokens}"
+        )
 
         print(
             f"[PegaKVConnector] Request {req_id}: Worker reports {matched_blocks} cached blocks "
@@ -688,6 +694,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             data_ptr = kv_cache.data_ptr()
             size_bytes = kv_cache.untyped_storage().nbytes()
+            element_size = kv_cache.element_size()
 
             # Detect KV cache layout:
             # - KV-first layout: shape = (2, num_blocks, block_size, num_heads, head_dim)
@@ -700,12 +707,18 @@ class PegaKVConnector(KVConnectorBase_V1):
             if len(shape) >= 2 and shape[0] == 2:
                 # KV-first layout: (2, num_blocks, ...)
                 num_blocks = shape[1]
-                bytes_per_block = stride[1] * kv_cache.element_size()
-                print(f"[PegaKVConnector] Detected KV-first layout for {layer_name}: num_blocks={num_blocks}")
+                bytes_per_block = stride[1] * element_size
+                kv_stride_bytes = stride[0] * element_size
+                segments = 2
+                print(
+                    f"[PegaKVConnector] Detected KV-first layout for {layer_name}: num_blocks={num_blocks}, kv_stride_bytes={kv_stride_bytes}"
+                )
             else:
                 # Blocks-first layout: (num_blocks, ...)
                 num_blocks = shape[0]
-                bytes_per_block = stride[0] * kv_cache.element_size()
+                bytes_per_block = stride[0] * element_size
+                kv_stride_bytes = 0
+                segments = 1
                 print(f"[PegaKVConnector] Detected blocks-first layout for {layer_name}: num_blocks={num_blocks}")
 
             if bytes_per_block == 0:
@@ -719,6 +732,8 @@ class PegaKVConnector(KVConnectorBase_V1):
                 size_bytes,
                 num_blocks,
                 bytes_per_block,
+                kv_stride_bytes,
+                segments,
             )
 
     def shutdown(self):

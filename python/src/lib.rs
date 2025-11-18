@@ -50,6 +50,8 @@ impl PegaEngine {
     ///     size_bytes: Total size of the tensor in bytes
     ///     num_blocks: Total number of paged blocks for this layer
     ///     bytes_per_block: Size of each paged block in bytes
+    ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
+    ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
     fn register_kv_cache(
         &mut self,
         layer_name: String,
@@ -57,6 +59,8 @@ impl PegaEngine {
         size_bytes: usize,
         num_blocks: usize,
         bytes_per_block: usize,
+        kv_stride_bytes: usize,
+        segments: usize,
     ) {
         self.engine.register_kv_cache(
             layer_name,
@@ -64,6 +68,8 @@ impl PegaEngine {
             size_bytes,
             num_blocks,
             bytes_per_block,
+            kv_stride_bytes,
+            segments,
         );
     }
 
