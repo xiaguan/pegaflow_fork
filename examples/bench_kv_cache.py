@@ -29,14 +29,16 @@ from typing import Optional
 
 class VLLMServer:
     """Context manager for vLLM server lifecycle."""
-    
-    def __init__(self, model: str, port: int, use_pegaflow: bool = False, 
-                 enable_prefix_caching: bool = False):
+
+    def __init__(self, model: str, port: int, use_pegaflow: bool = False,
+                 enable_prefix_caching: bool = False, log_file: Optional[Path] = None):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
         self.enable_prefix_caching = enable_prefix_caching
+        self.log_file = log_file
         self.process: Optional[subprocess.Popen] = None
+        self.log_handle = None
         
     def __enter__(self):
         """Start the vLLM server."""
@@ -68,13 +70,22 @@ class VLLMServer:
             f"(prefix caching {cache_state})"
         )
 
-        # Redirect output to /dev/null to avoid blocking
-        with open('/dev/null', 'w') as devnull:
+        # Redirect output to log file if provided, otherwise to /dev/null
+        if self.log_file:
+            print(f"[{server_label}] Logging to: {self.log_file}")
+            self.log_handle = open(self.log_file, 'w')
             self.process = subprocess.Popen(
                 cmd,
-                stdout=devnull,
-                stderr=devnull,
+                stdout=self.log_handle,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout
             )
+        else:
+            with open('/dev/null', 'w') as devnull:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=devnull,
+                    stderr=devnull,
+                )
         
         # Wait for server to be ready
         self._wait_for_ready()
@@ -93,6 +104,10 @@ class VLLMServer:
                 self.process.kill()
                 self.process.wait()
             print("Server stopped.\n")
+
+        # Close log file if it was opened
+        if self.log_handle:
+            self.log_handle.close()
     
     def _wait_for_ready(self, timeout: int = 120):
         """Wait for the server to be ready to accept requests."""
@@ -310,8 +325,9 @@ def main():
     print("PHASE 1: BASELINE vLLM (Prefix Caching Disabled)")
     print("="*70)
 
+    baseline_log = run_dir / "baseline_server.log"
     with VLLMServer(args.model, args.baseline_port, use_pegaflow=False,
-                    enable_prefix_caching=False):
+                    enable_prefix_caching=False, log_file=baseline_log):
         # Cold cache run
         result_file = run_dir / "baseline_cold.json"
         all_results["baseline_cold"] = run_benchmark(
@@ -331,8 +347,9 @@ def main():
     print("PHASE 2: PEGAFLOW vLLM (KV Cache Connector Enabled)")
     print("="*70)
 
+    pegaflow_log = run_dir / "pegaflow_server.log"
     with VLLMServer(args.model, args.pegaflow_port, use_pegaflow=True,
-                    enable_prefix_caching=False):
+                    enable_prefix_caching=False, log_file=pegaflow_log):
         # Cold cache run
         result_file = run_dir / "pegaflow_cold.json"
         all_results["pegaflow_cold"] = run_benchmark(
