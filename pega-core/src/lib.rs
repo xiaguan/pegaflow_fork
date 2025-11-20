@@ -104,7 +104,7 @@ impl PegaEngine {
 
     /// Register a KV cache region with its layout info
     #[instrument(
-        level = "info",
+        level = "debug",
         skip(self),
         fields(layer = %layer_name, size_bytes, num_blocks, bytes_per_block)
     )]
@@ -283,7 +283,7 @@ impl PegaEngine {
     /// Returns:
     ///   - Vec<bool>: For each hash, true if available in storage
     #[instrument(
-        level = "info",
+        level = "debug",
         skip(self, block_hashes),
         fields(layer = %layer_name, requested = %block_hashes.len()),
         ret
