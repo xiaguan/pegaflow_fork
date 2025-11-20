@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Benchmark script to compare vLLM baseline performance against PegaFlow's KV cache connector.
+Benchmark script to compare LMCache performance against PegaFlow's KV cache connector.
 
 This script automates the following workflow:
-1. Start baseline vLLM server (prefix caching disabled)
+1. Start LMCache vLLM server (local CPU backend)
 2. Run benchmark CLI - first execution (cold cache)
 3. Run benchmark CLI - second execution (warm cache)
-4. Stop baseline vLLM server
+4. Stop LMCache vLLM server
 5. Start vLLM server with PegaFlow connector enabled
 6. Run benchmark CLI - first execution (cold cache)
 7. Run benchmark CLI - second execution (warm cache)
@@ -31,11 +31,13 @@ class VLLMServer:
     """Context manager for vLLM server lifecycle."""
 
     def __init__(self, model: str, port: int, use_pegaflow: bool = False,
-                 enable_prefix_caching: bool = False, log_file: Optional[Path] = None,
+                 use_lmcache: bool = False, enable_prefix_caching: bool = False, 
+                 log_file: Optional[Path] = None,
                  health_endpoints: Optional[Sequence[str]] = None):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
+        self.use_lmcache = use_lmcache
         self.enable_prefix_caching = enable_prefix_caching
         self.log_file = log_file
         self.health_endpoints = list(health_endpoints) if health_endpoints else [
@@ -48,6 +50,13 @@ class VLLMServer:
         
     def __enter__(self):
         """Start the vLLM server."""
+        # Set up LMCache environment variables if using LMCache
+        if self.use_lmcache:
+            import os
+            os.environ["LMCACHE_CHUNK_SIZE"] = "256"
+            os.environ["LMCACHE_LOCAL_CPU"] = "True"
+            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "12.0"
+        
         cmd = [
             "vllm", "serve", self.model,
             "--port", str(self.port),
@@ -68,8 +77,17 @@ class VLLMServer:
             cmd.extend([
                 "--kv-transfer-config", json.dumps(kv_config),
             ])
+        elif self.use_lmcache:
+            # Add LMCache connector configuration using JSON format
+            kv_config = {
+                "kv_connector": "LMCacheConnectorV1",
+                "kv_role": "kv_both",
+            }
+            cmd.extend([
+                "--kv-transfer-config", json.dumps(kv_config),
+            ])
         
-        server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+        server_label = "PegaFlow" if self.use_pegaflow else ("LMCache" if self.use_lmcache else "Baseline")
         cache_state = "enabled" if self.enable_prefix_caching else "disabled"
         print(
             f"\n[{server_label}] Starting vLLM server on port {self.port} "
@@ -100,7 +118,7 @@ class VLLMServer:
     def __exit__(self, exc_type, exc_val, exc_tb):  # noqa: U100
         """Stop the vLLM server."""
         if self.process:
-            server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
+            server_label = "PegaFlow" if self.use_pegaflow else ("LMCache" if self.use_lmcache else "Baseline")
             print(f"\n[{server_label}] Stopping vLLM server...")
             self.process.send_signal(signal.SIGTERM)
             try:
@@ -183,7 +201,7 @@ def run_benchmark(model: str, port: int, num_prompts: int, input_len: int, outpu
 def print_comparison(results: dict, args):
     """Print a concise summary of the four benchmark runs."""
     print("\n" + "=" * 80)
-    print("KV CACHE BENCHMARK SUMMARY (TTFT FOCUSED)")
+    print("LMCACHE vs PEGAFLOW KV CACHE BENCHMARK SUMMARY (TTFT FOCUSED)")
     print("=" * 80)
 
     print(
@@ -199,8 +217,8 @@ def print_comparison(results: dict, args):
     )
 
     configs = [
-        ("baseline_cold", "Baseline (Cold)"),
-        ("baseline_warm", "Baseline (Warm)"),
+        ("lmcache_cold", "LMCache (Cold)"),
+        ("lmcache_warm", "LMCache (Warm)"),
         ("pegaflow_cold", "PegaFlow (Cold)"),
         ("pegaflow_warm", "PegaFlow (Warm)"),
     ]
@@ -244,7 +262,7 @@ def print_comparison(results: dict, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark vLLM baseline vs PegaFlow KV cache connector"
+        description="Benchmark LMCache local CPU vs PegaFlow KV cache connector"
     )
     parser.add_argument(
         "--model",
@@ -271,10 +289,10 @@ def main():
         help="Output length in tokens (default: 1)"
     )
     parser.add_argument(
-        "--baseline-port",
+        "--lmcache-port",
         type=int,
         default=8000,
-        help="Port for baseline vLLM server (default: 8000)"
+        help="Port for LMCache vLLM server (default: 8000)"
     )
     parser.add_argument(
         "--pegaflow-port",
@@ -315,7 +333,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "="*70)
-    print("PEGAFLOW KV CACHE BENCHMARK")
+    print("PEGAFLOW vs LMCACHE KV CACHE BENCHMARK")
     print("="*70)
     print(f"Model:           {args.model}")
     print(f"Num Prompts:     {args.num_prompts}")
@@ -323,33 +341,33 @@ def main():
     print(f"Output Length:   {args.output_len} tokens")
     print(f"Request Rate:    {args.request_rate} req/s")
     print(f"Random Seed:     {args.seed}")
-    print(f"Baseline Port:   {args.baseline_port}")
+    print(f"LMCache Port:    {args.lmcache_port}")
     print(f"PegaFlow Port:   {args.pegaflow_port}")
     print(f"Results Dir:     {run_dir}")
     print("="*70)
 
     all_results = {}
 
-    # Phase 1: Baseline vLLM (no prefix caching)
+    # Phase 1: LMCache vLLM (local CPU backend)
     print("\n" + "="*70)
-    print("PHASE 1: BASELINE vLLM (Prefix Caching Disabled)")
+    print("PHASE 1: LMCACHE vLLM (Local CPU Backend)")
     print("="*70)
 
-    baseline_log = run_dir / "baseline_server.log"
-    with VLLMServer(args.model, args.baseline_port, use_pegaflow=False,
-                    enable_prefix_caching=False, log_file=baseline_log):
+    lmcache_log = run_dir / "lmcache_server.log"
+    with VLLMServer(args.model, args.lmcache_port, use_lmcache=True,
+                    enable_prefix_caching=False, log_file=lmcache_log):
         # Cold cache run
-        result_file = run_dir / "baseline_cold.json"
-        all_results["baseline_cold"] = run_benchmark(
-            args.model, args.baseline_port, args.num_prompts, args.input_len,
-            args.output_len, result_file, "baseline_cold", args.request_rate, args.seed
+        result_file = run_dir / "lmcache_cold.json"
+        all_results["lmcache_cold"] = run_benchmark(
+            args.model, args.lmcache_port, args.num_prompts, args.input_len,
+            args.output_len, result_file, "lmcache_cold", args.request_rate, args.seed
         )
 
         # Warm cache run (same requests again - using same seed for identical requests)
-        result_file = run_dir / "baseline_warm.json"
-        all_results["baseline_warm"] = run_benchmark(
-            args.model, args.baseline_port, args.num_prompts, args.input_len,
-            args.output_len, result_file, "baseline_warm", args.request_rate, args.seed
+        result_file = run_dir / "lmcache_warm.json"
+        all_results["lmcache_warm"] = run_benchmark(
+            args.model, args.lmcache_port, args.num_prompts, args.input_len,
+            args.output_len, result_file, "lmcache_warm", args.request_rate, args.seed
         )
 
     # Phase 2: PegaFlow vLLM (with KV connector)
