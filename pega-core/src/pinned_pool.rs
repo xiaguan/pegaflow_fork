@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{ptr::NonNull, sync::Mutex};
 
 use tracing::info;
 
@@ -6,7 +6,7 @@ use crate::allocator::{Allocation, ScaledOffsetAllocator};
 
 /// Manages a CUDA pinned memory pool and a byte-addressable allocator.
 pub struct PinnedMemoryPool {
-    base_ptr: *mut u8,
+    base_ptr: NonNull<u8>,
     allocator: Mutex<ScaledOffsetAllocator>,
 }
 
@@ -21,12 +21,13 @@ impl PinnedMemoryPool {
 
         let mut pool_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        unsafe {
+        let base_ptr = unsafe {
             let result = sys::cuMemAllocHost_v2(&mut pool_ptr, pool_size);
             if result != sys::cudaError_enum::CUDA_SUCCESS {
                 panic!("Failed to allocate pinned memory pool: {:?}", result);
             }
-        }
+            NonNull::new(pool_ptr as *mut u8).expect("cuMemAllocHost returned null pointer")
+        };
 
         let allocator = ScaledOffsetAllocator::new(pool_size as u64)
             .expect("Failed to create memory allocator");
@@ -38,7 +39,7 @@ impl PinnedMemoryPool {
         );
 
         Self {
-            base_ptr: pool_ptr as *mut u8,
+            base_ptr,
             allocator: Mutex::new(allocator),
         }
     }
@@ -65,7 +66,7 @@ impl PinnedMemoryPool {
             Err(err) => panic!("Pinned memory allocation error: {}", err),
         };
 
-        let ptr = unsafe { self.base_ptr.add(allocation.offset_bytes as usize) };
+        let ptr = unsafe { self.base_ptr.as_ptr().add(allocation.offset_bytes as usize) };
         (allocation, ptr)
     }
 
@@ -89,18 +90,13 @@ impl Drop for PinnedMemoryPool {
     fn drop(&mut self) {
         use cudarc::driver::sys;
 
-        if !self.base_ptr.is_null() {
-            unsafe {
-                let result = sys::cuMemFreeHost(self.base_ptr as *mut std::ffi::c_void);
-                if result != sys::cudaError_enum::CUDA_SUCCESS {
-                    eprintln!("Warning: Failed to free pinned memory pool: {:?}", result);
-                }
+        unsafe {
+            let result = sys::cuMemFreeHost(self.base_ptr.as_ptr() as *mut std::ffi::c_void);
+            if result != sys::cudaError_enum::CUDA_SUCCESS {
+                eprintln!("Warning: Failed to free pinned memory pool: {:?}", result);
             }
-            info!("Freed pinned memory pool");
         }
+        info!("Freed pinned memory pool");
     }
 }
 
-// Safety: The pool owns its CUDA allocation and protects internal state with a mutex.
-unsafe impl Send for PinnedMemoryPool {}
-unsafe impl Sync for PinnedMemoryPool {}
