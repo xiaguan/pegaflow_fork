@@ -14,6 +14,13 @@ pub mod pinned_pool;
 // As long as vLLM keeps this layout we must respect its stride-based view and
 // fall back to strided transfers; future refactors can add dedicated handling
 // for other layouts without breaking this contract.
+//
+// To support efficient batching during "load" (CPU -> GPU), we now avoid
+// storing K and V interleaved in a single contiguous block. Instead, we allocate
+// all K segments for a saved batch in one contiguous CPU region, and all V segments
+// in another. This Split-Storage approach ensures that when we load the batch back,
+// the K source pointers are contiguous and can be merged into a single cuMemcpy,
+// significantly improving PCIe bandwidth utilization compared to strided copies.
 // ============================================================================
 
 use std::{
@@ -29,7 +36,7 @@ use tracing::{debug, info, instrument};
 
 use crate::pinned_pool::PinnedMemoryPool;
 
-const DEFAULT_PINNED_POOL_BYTES: usize = 10 * 1024 * 1024 * 1024; // 10GB
+const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
 const CACHE_USAGE_RATIO: f64 = 0.90;
 
 type BlockKey = (String, Vec<u8>);
@@ -75,31 +82,59 @@ pub struct KVCacheRegistration {
 }
 
 pub struct Block {
-    /// Pointer to pinned memory (not owned, managed by PegaEngine's pool)
-    ptr: *mut u8,
+    /// Pointer to K segment (or combined data if contiguous)
+    k_ptr: *mut u8,
+    /// Pointer to V segment (if stored separately)
+    v_ptr: Option<*mut u8>,
     size: usize,
-    /// Allocation handle for freeing memory (shared across multiple blocks)
-    allocation: Arc<Allocation>,
+    /// Allocation handle for K memory
+    k_allocation: Arc<Allocation>,
+    /// Allocation handle for V memory (if separate from K)
+    v_allocation: Option<Arc<Allocation>>,
     pool: Arc<PinnedMemoryPool>,
 }
 
 impl Block {
-    fn new(
+    fn new_contiguous(
         ptr: *mut u8,
         size: usize,
         allocation: Arc<Allocation>,
         pool: Arc<PinnedMemoryPool>,
     ) -> Self {
         Self {
-            ptr,
+            k_ptr: ptr,
+            v_ptr: None,
             size,
-            allocation,
+            k_allocation: allocation,
+            v_allocation: None,
             pool,
         }
     }
 
-    fn ptr(&self) -> *mut u8 {
-        self.ptr
+    fn new_split(
+        k_ptr: *mut u8,
+        v_ptr: *mut u8,
+        size: usize,
+        k_allocation: Arc<Allocation>,
+        v_allocation: Arc<Allocation>,
+        pool: Arc<PinnedMemoryPool>,
+    ) -> Self {
+        Self {
+            k_ptr,
+            v_ptr: Some(v_ptr),
+            size,
+            k_allocation,
+            v_allocation: Some(v_allocation),
+            pool,
+        }
+    }
+
+    fn k_ptr(&self) -> *mut u8 {
+        self.k_ptr
+    }
+
+    fn v_ptr(&self) -> Option<*mut u8> {
+        self.v_ptr
     }
 
     fn size(&self) -> usize {
@@ -114,9 +149,15 @@ impl Block {
 
 impl Drop for Block {
     fn drop(&mut self) {
-        // Only free when this is the last reference to the allocation
-        if Arc::strong_count(&self.allocation) == 1 {
-            self.pool.free(*self.allocation);
+        // Free K allocation if last reference
+        if Arc::strong_count(&self.k_allocation) == 1 {
+            self.pool.free(*self.k_allocation);
+        }
+        // Free V allocation if exists and is last reference
+        if let Some(ref v_allocation) = self.v_allocation {
+            if Arc::strong_count(v_allocation) == 1 {
+                self.pool.free(**v_allocation);
+            }
         }
     }
 }
@@ -308,9 +349,9 @@ impl PegaEngine {
 
             // Allocate separate regions for K and V segments
             let (k_allocation, k_base_ptr) = self.allocate_pinned(k_total_size);
-            let (_v_allocation, v_base_ptr) = self.allocate_pinned(v_total_size);
+            let (v_allocation, v_base_ptr) = self.allocate_pinned(v_total_size);
             let k_shared_allocation = Arc::new(k_allocation);
-            let _v_shared_allocation = Arc::new(_v_allocation);
+            let v_shared_allocation = Arc::new(v_allocation);
 
             // Calculate GPU offsets for batching
             let mut k_offsets_with_idx = Vec::with_capacity(num_blocks);
@@ -340,18 +381,14 @@ impl PegaEngine {
                 let k_ptr = unsafe { k_base_ptr.add(i * segment_size) };
                 let v_ptr = unsafe { v_base_ptr.add(i * segment_size) };
 
-                // Create a single block that spans both K and V data
-                // We'll store them contiguously: K data followed by V data
-                let combined_ptr = k_ptr; // Start with K data
-                unsafe {
-                    // Copy V data right after K data
-                    std::ptr::copy_nonoverlapping(v_ptr, k_ptr.add(segment_size), segment_size);
-                }
-
-                let block = Arc::new(Block::new(
-                    combined_ptr,
+                // We now keep K and V data in separate allocations during their lifetime
+                // This avoids the memory overwrite bug and keeps data contiguous for better batching next time
+                let block = Arc::new(Block::new_split(
+                    k_ptr,
+                    v_ptr,
                     block_size,
-                    Arc::clone(&k_shared_allocation), // Use K allocation for the combined block
+                    Arc::clone(&k_shared_allocation),
+                    Arc::clone(&v_shared_allocation),
                     Arc::clone(&self.pinned_pool),
                 ));
                 self.kv_storage.insert(key, block);
@@ -368,7 +405,7 @@ impl PegaEngine {
                 self.copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr)
                     .unwrap();
 
-                let block = Arc::new(Block::new(
+                let block = Arc::new(Block::new_contiguous(
                     cpu_ptr,
                     block_size,
                     Arc::clone(&shared_allocation),
@@ -531,9 +568,23 @@ impl PegaEngine {
                 let k_gpu_offset = self.segment_offset(&registration, *block_idx, 0)?;
                 let v_gpu_offset = self.segment_offset(&registration, *block_idx, 1)?;
 
-                // K segment is at the beginning of stored block, V segment follows
-                let k_cpu_ptr = block.ptr() as *const u8;
-                let v_cpu_ptr = unsafe { k_cpu_ptr.add(segment_size) };
+                // K segment is at k_ptr, V segment is at v_ptr
+                // In the new split layout, they are in separate memory regions provided by Block::new_split
+                // In the legacy or different layout, check logic. But for this branch (segments == 2 && stride > block),
+                // we assume it's the split layout we just optimized.
+                let k_cpu_ptr = block.k_ptr() as *const u8;
+
+                // Fallback for old blocks if any, or correct new blocks
+                // If v_ptr is None, it means it was stored as contiguous block (maybe old version data or different path block?)
+                // But if we are in this branch, we expect split handling.
+                // However, let's support "contiguous block loaded into split GPU layout" just in case?
+                // No, for now we assume data saved with new logic has v_ptr.
+                let v_cpu_ptr = if let Some(v_ptr) = block.v_ptr() {
+                    v_ptr as *const u8
+                } else {
+                    // If it was stored contiguously (e.g. old format), V follows K
+                    unsafe { k_cpu_ptr.add(segment_size) }
+                };
 
                 k_transfers.push((k_gpu_offset, k_cpu_ptr));
                 v_transfers.push((v_gpu_offset, v_cpu_ptr));
@@ -556,7 +607,7 @@ impl PegaEngine {
                 self.copy_block_cpu_to_gpu(
                     &registration,
                     block_idx,
-                    block.ptr() as *const u8,
+                    block.k_ptr() as *const u8,
                     &stream,
                 )?;
                 total_transfer += block.size();
@@ -742,59 +793,46 @@ impl PegaEngine {
         stream: &CudaStream,
     ) -> Result<(), String> {
         let total_segments = transfers.len();
+        if total_segments == 0 {
+            info!("CPU->GPU batch copy: 0 segments -> 0 batches");
+            return Ok(());
+        }
+
         let mut batch_count = 0;
         let mut i = 0;
 
-        while i < transfers.len() {
+        while i < total_segments {
             let (start_gpu_offset, start_cpu_ptr) = transfers[i];
             let mut count = 1;
 
-            // Find contiguous range in GPU memory
-            for j in i + 1..transfers.len() {
-                let (gpu_offset, _) = transfers[j];
-                if gpu_offset == start_gpu_offset + count * segment_size {
+            while i + count < total_segments {
+                let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
+
+                let expected_gpu_offset = start_gpu_offset + count * segment_size;
+                let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
+
+                if next_gpu_offset == expected_gpu_offset && next_cpu_ptr == expected_cpu_ptr {
                     count += 1;
                 } else {
                     break;
                 }
             }
 
-            if count > 1 {
-                // Check if CPU pointers are also contiguous
-                let cpu_contiguous = (1..count).all(|k| {
-                    let (_, cpu_ptr) = transfers[i + k];
-                    let expected_ptr = unsafe { start_cpu_ptr.add(k * segment_size) };
-                    cpu_ptr == expected_ptr
-                });
+            let total_size = segment_size
+                .checked_mul(count)
+                .ok_or_else(|| "batch_copy_segments_to_gpu: total_size overflow".to_string())?;
 
-                if cpu_contiguous {
-                    // Batch copy contiguous range
-                    let total_size = count * segment_size;
-                    let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
-                    self.copy_cpu_to_gpu_async(
-                        registration.data_ptr,
-                        start_gpu_offset,
-                        buffer,
-                        total_size,
-                        stream,
-                    )?;
-                    batch_count += 1;
-                    i += count;
-                    continue;
-                }
-            }
-
-            // Copy individual segment
-            let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, segment_size) };
+            let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
             self.copy_cpu_to_gpu_async(
                 registration.data_ptr,
                 start_gpu_offset,
                 buffer,
-                segment_size,
+                total_size,
                 stream,
             )?;
+
             batch_count += 1;
-            i += 1;
+            i += count;
         }
 
         debug!(
