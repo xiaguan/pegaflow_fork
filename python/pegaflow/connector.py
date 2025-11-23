@@ -23,11 +23,11 @@ referencing it via its full import path.
 import functools
 import logging
 import os
-import pickle
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgpack
 import torch
 import zmq
 
@@ -648,13 +648,14 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             hit_blocks = 0
             try:
-                payload = pickle.loads(message)
-                block_hashes = payload.get("block_hashes", [])
+                # Directly deserialize block_hashes list for faster deserialization
+                block_hashes = msgpack.unpackb(message)
                 hit_blocks = self._count_available_block_prefix(block_hashes)
             except Exception:
                 hit_blocks = 0
 
-            reply = pickle.dumps({"hit_blocks": hit_blocks})
+            # Directly serialize hit_blocks int for faster serialization
+            reply = msgpack.packb(hit_blocks)
             try:
                 self._lookup_server_socket.send(reply)
             except zmq.error.ZMQError:
@@ -689,10 +690,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         except Exception:
             return 0
 
-        payload = pickle.dumps({
-            "req_id": req_id,
-            "block_hashes": block_hashes,
-        })
+        # Directly serialize block_hashes list for faster serialization
+        payload = msgpack.packb(block_hashes)
 
         lookup_start = time.perf_counter()
         try:
@@ -704,11 +703,11 @@ class PegaKVConnector(KVConnectorBase_V1):
         lookup_end = time.perf_counter()
 
         try:
-            response = pickle.loads(reply)
+            # Directly deserialize hit_blocks int for faster deserialization
+            hit_blocks = int(msgpack.unpackb(reply))
         except Exception:
             return 0
 
-        hit_blocks = int(response.get("hit_blocks", 0))
         total_blocks = len(block_hashes)
         elapsed_us = (lookup_end - lookup_start) * 1e6
         logger.info(
