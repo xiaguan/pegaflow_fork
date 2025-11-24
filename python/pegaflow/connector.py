@@ -343,6 +343,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             layer_name: the name of that layer
         """
         try:
+            # TODO: if the model has 100 layers, we will send 100 requests to the engine
+            # That is not efficient. We should try to batch the requests.
             self._send_engine_request('WAIT_LAYER', {'layer_name': layer_name})
         except Exception as exc:
             logger.debug(
