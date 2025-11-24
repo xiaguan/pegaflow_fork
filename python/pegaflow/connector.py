@@ -199,13 +199,17 @@ class PegaKVConnector(KVConnectorBase_V1):
             try:
                 self._ensure_engine_socket()
 
-                # Send request
-                request = (command, payload)
-                self._engine_socket.send(pickle.dumps(request))
+                # Send request using multipart: [command, payload]
+                command_bytes = msgpack.packb(command)
+                payload_bytes = msgpack.packb(payload, use_bin_type=True)
+                self._engine_socket.send_multipart([command_bytes, payload_bytes])
 
-                # Receive response
-                response_bytes = self._engine_socket.recv()
-                response = pickle.loads(response_bytes)
+                # Receive response using multipart
+                response_parts = self._engine_socket.recv_multipart()
+                if len(response_parts) != 1:
+                    raise RuntimeError(f"Invalid response format: expected 1 part, got {len(response_parts)}")
+
+                response = msgpack.unpackb(response_parts[0], raw=False)
 
                 if response.get('status') != 'success':
                     error_msg = response.get('message', 'Unknown error')

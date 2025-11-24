@@ -38,6 +38,7 @@ import signal
 import sys
 from typing import Any, Dict, Optional
 
+import msgpack
 import torch
 import zmq
 
@@ -314,11 +315,15 @@ class PegaEngineServer:
 
         while self.running:
             try:
-                # Receive request
-                message = self.socket.recv()
+                # Receive request using multipart: [command, payload]
+                message_parts = self.socket.recv_multipart()
 
-                # Deserialize request
-                command, payload = pickle.loads(message)
+                if len(message_parts) != 2:
+                    raise ValueError(f"Invalid request format: expected 2 parts, got {len(message_parts)}")
+
+                # Deserialize command and payload
+                command = msgpack.unpackb(message_parts[0], raw=False)
+                payload = msgpack.unpackb(message_parts[1], raw=False)
 
                 # Dispatch command
                 if command == 'REGISTER':
@@ -339,8 +344,9 @@ class PegaEngineServer:
                         'message': f'Unknown command: {command}'
                     }
 
-                # Send response
-                self.socket.send(pickle.dumps(response))
+                # Send response using multipart
+                response_bytes = msgpack.packb(response, use_bin_type=True)
+                self.socket.send_multipart([response_bytes])
 
             except zmq.ZMQError as e:
                 if not self.running:
@@ -351,7 +357,8 @@ class PegaEngineServer:
                 # Send error response
                 try:
                     response = {'status': 'error', 'message': str(e)}
-                    self.socket.send(pickle.dumps(response))
+                    response_bytes = msgpack.packb(response, use_bin_type=True)
+                    self.socket.send_multipart([response_bytes])
                 except Exception:
                     pass
 
