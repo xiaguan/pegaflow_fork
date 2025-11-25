@@ -288,8 +288,6 @@ impl PegaEngine {
             .map_err(|_| EngineError::Poisoned("contexts write"))?
             .remove(context_id);
 
-        self.storage.clear_context(context_id);
-
         if removed.is_none() {
             return Err(EngineError::ContextMissing(context_id.to_string()));
         }
@@ -343,9 +341,7 @@ impl PegaEngine {
             }
 
             // Check if this block_hash already has data for this layer
-            let needs_save = !self
-                .storage
-                .layer_has_block(context_id, block_hash, layer_id);
+            let needs_save = !self.storage.layer_has_block(block_hash, layer_id);
 
             if needs_save {
                 blocks_to_save.push((block_idx, block_hash.clone()));
@@ -357,8 +353,6 @@ impl PegaEngine {
         }
 
         let block_size = transfer::block_size(&registration).unwrap();
-        self.storage
-            .initialize_layer_count(context_id, total_layers);
         let num_blocks = blocks_to_save.len();
 
         // For layer-first layout with KV stride, allocate separate regions for K and V
@@ -423,7 +417,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(context_id, block_hash, layer_id, block);
+                    .insert_block(block_hash, layer_id, block, total_layers);
             }
         } else {
             // Original logic for contiguous or single-segment layouts
@@ -443,7 +437,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(context_id, block_hash, layer_id, block);
+                    .insert_block(block_hash, layer_id, block, total_layers);
             }
         }
         Ok(())
@@ -479,7 +473,7 @@ impl PegaEngine {
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {
-            if !self.storage.block_is_complete(context_id, block_hash) {
+            if !self.storage.block_is_complete(block_hash) {
                 break;
             }
             hit_count += 1;
@@ -527,7 +521,7 @@ impl PegaEngine {
         // Step 1: Lookup all block_hashes ONCE and cache the LayerBlocks
         let layer_blocks_cache = self
             .storage
-            .lookup_many_for_context(context_id, block_hashes)
+            .lookup_many(block_hashes)
             .map_err(EngineError::Storage)?;
 
         let stream = self.with_context(context_id, |ctx| Ok(ctx.stream()))?;

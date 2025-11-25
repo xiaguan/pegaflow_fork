@@ -66,6 +66,7 @@ class VLLMServer:
             "--port", str(self.port),
             "--enforce-eager",
             "--trust-remote-code",
+            "--prefix-caching-hash-algo", "sha256_cbor",
         ]
 
         if not self.enable_prefix_caching:
