@@ -74,7 +74,15 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
    uv install vllm
    ```
 
-3. Build the PyO3 bindings via maturin:
+3. Start the PegaEngine server (required before running examples):
+
+   ```bash
+   ./scripts/start_pega_engine.sh --device 0
+   ```
+
+   This starts the PegaEngine server that handles KV cache operations. Keep it running in a separate terminal.
+
+4. Build the PyO3 bindings via maturin:
 
    ```bash
    cd python
@@ -82,7 +90,7 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
    cd ..
    ```
 
-4. Run the hello-world connector example:
+5. Run the hello-world connector example:
 
    ```bash
    uv run python examples/basic_vllm.py
@@ -90,9 +98,9 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
 
 The script loads GPT-2 through vLLM, runs a deterministic prompt twice, and prints both latencies so you can verify the connector is correctly persisting/restoring KV cache.
 
-### LMCache Comparison Bench
+### KV Cache Benchmark
 
-`examples/bench_kv_cache.py` automates a full TTFT-focused comparison between LMCache and PegaFlow. Provide your own checkpoint path (we usually test with a Llama-3.1-8B variant on H800):
+`examples/bench_kv_cache.py` automates a full TTFT-focused benchmark of PegaFlow's KV cache performance. Provide your own checkpoint path (we usually test with a Llama-3.1-8B variant on H800):
 
 ```bash
 uv run python examples/bench_kv_cache.py \
@@ -100,19 +108,16 @@ uv run python examples/bench_kv_cache.py \
   --num-prompts 10 \
   --input-len 4096 \
   --output-len 1 \
-  --request-rate 1.0 \
-  --with-lmcache
+  --request-rate 1.0
 ```
 
 H800 Reference Numbers
 
-Latest TTFT measurements from an H800 (10 prompts, 4K-token prefill, 1-token decode):
+PegaFlow TTFT measurements from an H800 (10 prompts, 4K-token prefill, 1-token decode):
 
 | Configuration    | TTFT mean (ms) | TTFT p99 (ms) |
 |------------------|----------------|---------------|
-| LMCache (Cold)   | 138.6          | 191.9         |
-| LMCache (Warm)   | 55.3           | 68.3          |
 | PegaFlow (Cold)  | 193.0          | 302.2         |
 | PegaFlow (Warm)  | 54.7           | 63.2          |
 
-Warm-start latency is virtually identical between LMCache and PegaFlow; cold-start differences highlight remaining optimizations on our side.
+The warm-start path shows significant TTFT improvement over cold-start, demonstrating effective KV cache sharing.
