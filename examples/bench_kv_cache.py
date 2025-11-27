@@ -74,7 +74,6 @@ class VLLMServer:
         cmd.extend([
             "vllm", "serve", self.model,
             "--port", str(self.port),
-            "--enforce-eager",
             "--trust-remote-code",
             "--data-parallel-size", "1",
             "--prefix-caching-hash-algo", "sha256_cbor",
@@ -149,7 +148,7 @@ class VLLMServer:
         if self.log_handle:
             self.log_handle.close()
     
-    def _wait_for_ready(self, timeout: int = 120):
+    def _wait_for_ready(self, timeout: int = 180):
         """Wait for the server to be ready to accept requests."""
         import requests
         
@@ -297,7 +296,7 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=1,
+        default=20,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(

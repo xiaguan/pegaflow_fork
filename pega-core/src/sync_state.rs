@@ -104,7 +104,6 @@ impl LayerSyncState {
         if layer_id >= self.num_layers {
             return;
         }
-        info!("layer {} done", layer_id);
         let ptr = self.shmem.as_ptr() as *mut AtomicU8;
         unsafe {
             (*ptr.add(layer_id)).store(FLAG_COMPLETED, Ordering::Release);

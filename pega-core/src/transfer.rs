@@ -1,5 +1,5 @@
 use cudarc::driver::CudaStream;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::KVCacheRegistration;
 
@@ -217,7 +217,7 @@ pub(crate) fn batch_copy_segments_to_gpu(
         i += count;
     }
 
-    debug!(
+    info!(
         "CPU->GPU batch copy: {} segments -> {} batches ({}x reduction)",
         total_segments,
         batch_count,
