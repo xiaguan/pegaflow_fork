@@ -8,6 +8,7 @@ This module defines :class:`PegaKVConnector`, a subclass of
 
 import os
 import pickle
+import queue
 import threading
 import time
 import uuid
@@ -128,9 +129,16 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._engine_socket = None
         self._engine_lock = threading.Lock()
 
+        # Async save worker
+        self._save_queue = queue.Queue()
+        self._save_exception: Optional[Exception] = None
+        self._save_thread = threading.Thread(
+            target=self._save_worker, daemon=True, name="PegaSaveWorker"
+        )
+        self._save_thread.start()
+
         # State tracking
         self._request_block_hashes = {}  # req_id -> list[bytes]
-        self._pending_saves = []  # list[dict]
         self._requests_to_load = {}  # req_id -> dict with load info
         self._registered_layers: list[str] = []
 
@@ -160,6 +168,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
     def _send_engine_request(self, command: str, payload: dict) -> dict:
         """Send request to engine server and get response."""
+        # Prepare payload
         payload = dict(payload)
         payload.setdefault("instance_id", self._instance_id)
         if self._tp_rank is not None:
@@ -169,18 +178,109 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         with self._engine_lock:
             self._ensure_engine_socket()
+            return self._zmq_send_recv(self._engine_socket, command, payload)
 
-            command_bytes = msgpack.packb(command)
-            payload_bytes = msgpack.packb(payload, use_bin_type=True)
-            self._engine_socket.send_multipart([command_bytes, payload_bytes])
+    def _zmq_send_recv(self, socket: zmq.Socket, command: str, payload: dict) -> dict:
+        """Helper for ZMQ send/recv logic."""
+        command_bytes = msgpack.packb(command)
+        payload_bytes = msgpack.packb(payload, use_bin_type=True)
+        socket.send_multipart([command_bytes, payload_bytes])
 
-            response_parts = self._engine_socket.recv_multipart()
-            assert len(response_parts) == 1, f"Invalid response format: expected 1 part, got {len(response_parts)}"
+        response_parts = socket.recv_multipart()
+        assert len(response_parts) == 1, f"Invalid response format: expected 1 part, got {len(response_parts)}"
 
-            response = msgpack.unpackb(response_parts[0], raw=False)
-            assert response.get('status') == 'success', f"Engine request failed: {response.get('message', 'Unknown error')}"
+        response = msgpack.unpackb(response_parts[0], raw=False)
+        assert response.get('status') == 'success', f"Engine request failed: {response.get('message', 'Unknown error')}"
+        return response
 
-            return response
+    def _save_worker(self) -> None:
+        """Background worker for handling async save requests."""
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.RCVTIMEO, 20000)
+        socket.setsockopt(zmq.SNDTIMEO, 20000)
+        socket.connect(self._engine_endpoint)
+        logger.info("[PegaKVConnector] Save worker thread started")
+
+        try:
+            while True:
+                task = self._save_queue.get()
+                if task is None:
+                    self._save_queue.task_done()
+                    break
+
+                try:
+                    self._process_save_task(task, socket)
+                except Exception as e:
+                    logger.error(f"[PegaKVConnector] Save worker error: {e}", exc_info=True)
+                    self._save_exception = e
+                finally:
+                    self._save_queue.task_done()
+        except Exception as e:
+            logger.critical(f"[PegaKVConnector] Save worker crashed: {e}", exc_info=True)
+            self._save_exception = e
+        finally:
+            socket.close()
+            context.term()
+            logger.info("[PegaKVConnector] Save worker thread stopped")
+
+    def _process_save_task(self, task: dict, socket: zmq.Socket) -> None:
+        """Process a single save task in the worker thread."""
+        layer_name = task['layer_name']
+        attn_metadata = task['attn_metadata']
+        metadata = task['metadata']
+
+        if attn_metadata.block_table is None:
+            return
+
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        layer_blocks_saved = 0
+
+        # Common payload fields
+        payload_base = {
+            "instance_id": self._instance_id,
+            "layer_name": layer_name,
+        }
+        if self._tp_rank is not None:
+            payload_base["tp_rank"] = self._tp_rank
+        if self._device_id is not None:
+            payload_base["device_id"] = self._device_id
+
+        for seq_idx in range(block_table.shape[0]):
+            if seq_lens is not None:
+                seq_len = seq_lens[seq_idx].item()
+                num_blocks = (seq_len + self._block_size - 1) // self._block_size
+            else:
+                num_blocks = (block_table[seq_idx] != 0).sum().item()
+
+            if num_blocks == 0:
+                continue
+
+            active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
+
+            # Find matching block hashes from metadata
+            block_hashes_for_seq = None
+            for req_id, hashes in metadata.block_hashes.items():
+                if len(hashes) > 0:
+                    num_use = min(num_blocks, len(hashes))
+                    block_hashes_for_seq = hashes[:num_use]
+                    active_blocks = active_blocks[:num_use]
+                    break
+
+            if block_hashes_for_seq is None:
+                continue
+
+            # Send SAVE request
+            payload = payload_base.copy()
+            payload.update({
+                'block_ids': active_blocks,
+                'block_hashes': block_hashes_for_seq,
+            })
+            self._zmq_send_recv(socket, 'SAVE', payload)
+            layer_blocks_saved += len(block_hashes_for_seq)
+
+        # We could log per-layer stats here if verbose logging is enabled
 
     # ==============================
     # Worker-side methods
@@ -282,8 +382,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._load_in_progress = False
 
         metadata = self._get_connector_metadata()
-        if not isinstance(metadata, PegaConnectorMetadata):
-            return
 
         if not metadata.requests_to_load:
             return
@@ -352,8 +450,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._sync_state.wait_layer(layer_id)
             return
 
-        # Fallback to ZMQ call
-        self._send_engine_request('WAIT_LAYER', {'layer_name': layer_name})
+        raise NotImplementedError("wait_for_layer_load through ZMQ not supported")
 
     def save_kv_layer(
         self,
@@ -374,9 +471,14 @@ class PegaKVConnector(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-        self._pending_saves.append({
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, PegaConnectorMetadata):
+            return
+
+        self._save_queue.put({
             'layer_name': layer_name,
             'attn_metadata': attn_metadata,
+            'metadata': metadata,
         })
 
     @timing_wrapper
@@ -388,75 +490,12 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        if not self._pending_saves:
-            return
+        self._save_queue.join()
 
-        total_start = time.perf_counter()
-
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, PegaConnectorMetadata):
-            self._pending_saves.clear()
-            return
-
-        total_blocks_saved = 0
-        total_layers_saved = 0
-
-        for save_info in self._pending_saves:
-            layer_name = save_info['layer_name']
-            attn_metadata = save_info['attn_metadata']
-
-            if attn_metadata.block_table is None:
-                continue
-
-            block_table = attn_metadata.block_table
-            seq_lens = attn_metadata.seq_lens
-            layer_blocks_saved = 0
-
-            for seq_idx in range(block_table.shape[0]):
-                if seq_lens is not None:
-                    seq_len = seq_lens[seq_idx].item()
-                    num_blocks = (seq_len + self._block_size - 1) // self._block_size
-                else:
-                    num_blocks = (block_table[seq_idx] != 0).sum().item()
-
-                if num_blocks == 0:
-                    continue
-
-                active_blocks = block_table[seq_idx, :num_blocks].cpu().tolist()
-
-                # Find matching block hashes from metadata
-                block_hashes_for_seq = None
-                for req_id, hashes in metadata.block_hashes.items():
-                    if len(hashes) > 0:
-                        num_use = min(num_blocks, len(hashes))
-                        block_hashes_for_seq = hashes[:num_use]
-                        active_blocks = active_blocks[:num_use]
-                        break
-
-                if block_hashes_for_seq is None:
-                    continue
-
-                self._send_engine_request('SAVE', {
-                    'layer_name': layer_name,
-                    'block_ids': active_blocks,
-                    'block_hashes': block_hashes_for_seq,
-                })
-                layer_blocks_saved += len(block_hashes_for_seq)
-
-            if layer_blocks_saved > 0:
-                total_blocks_saved += layer_blocks_saved
-                total_layers_saved += 1
-
-        total_end = time.perf_counter()
-        total_time_ms = (total_end - total_start) * 1000
-
-        if total_blocks_saved > 0:
-            logger.debug(
-                "[PegaKVConnector] saved %d blocks across %d layers (%.2f ms)",
-                total_blocks_saved, total_layers_saved, total_time_ms,
-            )
-
-        self._pending_saves.clear()
+        if self._save_exception:
+            e = self._save_exception
+            self._save_exception = None
+            raise e
 
     # ==============================
     # Scheduler-side methods
@@ -833,6 +872,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         completed and the connector is cleaned up properly.
         """
         self.unregister_context()
+
+        # Stop save worker
+        self._save_queue.put(None)
+        self._save_thread.join()
 
         if self._engine_socket is not None:
             self._engine_socket.close(0)

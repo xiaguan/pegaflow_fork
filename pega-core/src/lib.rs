@@ -135,11 +135,6 @@ impl WorkerContext {
         self.stream.clone()
     }
 
-    fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
-        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
-        guard.insert(layer_name.to_string(), event);
-    }
-
     fn take_layer_event(&self, layer_name: &str) -> Option<CudaEvent> {
         let mut guard = self.layer_events.lock().expect("layer events map poisoned");
         guard.remove(layer_name)

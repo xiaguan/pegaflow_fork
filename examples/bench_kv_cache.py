@@ -37,7 +37,8 @@ class VLLMServer:
     def __init__(self, model: str, port: int, use_pegaflow: bool = False,
                  use_lmcache: bool = False, enable_prefix_caching: bool = False, 
                  log_file: Optional[Path] = None,
-                 health_endpoints: Optional[Sequence[str]] = None):
+                 health_endpoints: Optional[Sequence[str]] = None,
+                 profile_output: Optional[Path] = None):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
@@ -49,6 +50,7 @@ class VLLMServer:
             "/metrics",
             "/invocations",
         ]
+        self.profile_output = profile_output
         self.process: Optional[subprocess.Popen] = None
         self.log_handle = None
         
@@ -61,14 +63,22 @@ class VLLMServer:
             os.environ["LMCACHE_LOCAL_CPU"] = "True"
             os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "32.0"
         
-        cmd = [
+        cmd = []
+        if self.profile_output:
+            cmd.extend([
+                "nsys", "profile",
+                "--output", str(self.profile_output),
+                "--force-overwrite", "true",
+            ])
+        
+        cmd.extend([
             "vllm", "serve", self.model,
             "--port", str(self.port),
             "--enforce-eager",
             "--trust-remote-code",
             "--data-parallel-size", "1",
             "--prefix-caching-hash-algo", "sha256_cbor",
-        ]
+        ])
 
         if not self.enable_prefix_caching:
             cmd.append("--no-enable-prefix-caching")
@@ -287,7 +297,7 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=20,
+        default=1,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
@@ -340,6 +350,11 @@ def main():
         help="Include LMCache benchmark for comparison. "
              "By default, only PegaFlow is tested (faster for development)."
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable nsys profiling for the vLLM server. Profiling results will be saved to the output directory."
+    )
 
     args = parser.parse_args()
 
@@ -366,6 +381,7 @@ def main():
         print(f"LMCache Port:    {args.lmcache_port}")
     print(f"PegaFlow Port:   {args.pegaflow_port}")
     print(f"Results Dir:     {run_dir}")
+    print(f"Profiling:       {'Enabled' if args.profile else 'Disabled'}")
     if not args.with_lmcache:
         print(f"LMCache:         Skipped (use --with-lmcache to enable)")
     print("="*70)
@@ -379,8 +395,10 @@ def main():
         print("="*70)
 
         lmcache_log = run_dir / "lmcache_server.log"
+        profile_path = run_dir / "lmcache" if args.profile else None
         with VLLMServer(args.model, args.lmcache_port, use_lmcache=True,
-                        enable_prefix_caching=False, log_file=lmcache_log):
+                        enable_prefix_caching=False, log_file=lmcache_log,
+                        profile_output=profile_path):
             # Cold cache run
             result_file = run_dir / "lmcache_cold.json"
             all_results["lmcache_cold"] = run_benchmark(
@@ -406,8 +424,10 @@ def main():
     print("="*70)
 
     pegaflow_log = run_dir / "pegaflow_server.log"
+    profile_path = run_dir / "pegaflow" if args.profile else None
     with VLLMServer(args.model, args.pegaflow_port, use_pegaflow=True,
-                    enable_prefix_caching=False, log_file=pegaflow_log):
+                    enable_prefix_caching=False, log_file=pegaflow_log,
+                    profile_output=profile_path):
         # Cold cache run
         result_file = run_dir / "pegaflow_cold.json"
         all_results["pegaflow_cold"] = run_benchmark(

@@ -9,7 +9,7 @@ import os
 import time
 
 # Environment variable to control timing logging
-ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "0") == "1"
+ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "1") == "1"
 
 # Module logger
 logger = logging.getLogger(__name__)
