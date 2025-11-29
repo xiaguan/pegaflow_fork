@@ -30,7 +30,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.logging_utils import get_connector_logger, timing_wrapper
-from pegaflow.pegaflow import PyLayerSyncState
+from pegaflow.pegaflow import PyLoadState
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -536,9 +536,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._trackers: Dict[str, RequestTracker] = {}
         self._registered_layers: list[str] = []
 
-        # Block size and sync state
+        # Block size
         self._block_size = vllm_config.cache_config.block_size
-        self._sync_state: Optional[PyLayerSyncState] = None
         self._layer_name_to_id: Dict[str, int] = {}
 
         # Async save completion tracking (Worker side)
@@ -775,17 +774,15 @@ class PegaKVConnector(KVConnectorBase_V1):
     @timing_wrapper
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """
-        Start loading the KV cache from the connector to vLLM's paged
-        KV buffer. This is called from the forward context before the
-        forward pass to enable async loading during model execution.
+        Load the KV cache from the connector to vLLM's paged KV buffer.
+
+        This is a synchronous operation: we submit async transfers to the engine,
+        create a LoadState for synchronization, and spin-wait until all transfers
+        complete before returning.
 
         Args:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
-
-        Note:
-            The number of elements in kv_caches and layer_names should be
-            the same.
         """
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, PegaConnectorMetadata):
@@ -817,48 +814,50 @@ class PegaKVConnector(KVConnectorBase_V1):
         if not target_layers:
             return
 
-        response = self._send_engine_request('LOAD', {
+        # Create LoadState for synchronization
+        load_state = PyLoadState()
+
+        self._send_engine_request('LOAD', {
+            'load_state_shm': load_state.shm_name(),
             'layer_names': target_layers,
             'block_ids': all_block_ids,
             'block_hashes': all_block_hashes,
         })
 
-        num_layers_loaded = response.get('num_layers_loaded', 0)
-        total_bytes = response.get('total_bytes', 0)
-        total_blocks = len(all_block_ids) * num_layers_loaded
+        num_layers = len(target_layers)
+        num_blocks = len(all_block_ids)
+
+        schedule_end = time.perf_counter()
+        schedule_time_us = (schedule_end - load_start) * 1e6
+
+        # Spin-wait for transfers to complete
+        state = load_state.wait()
+        if state < 0:
+            raise RuntimeError(f"KV cache load failed with state={state}")
 
         transfer_end = time.perf_counter()
         total_time_us = (transfer_end - load_start) * 1e6
-        total_time_s = total_time_us / 1e6
-        bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
 
         logger.info(
-            "[PegaKVConnector] queued %d blocks (%.2f GB) across %d layers for %d reqs, schedule %.0f us (%.2f GB/s)",
-            total_blocks, total_bytes / 1e9, num_layers_loaded, total_requests, total_time_us, bandwidth_gbps,
+            "[PegaKVConnector] loaded %d blocks across %d layers for %d reqs, "
+            "schedule %.0f us, total %.0f us",
+            num_blocks, num_layers, total_requests,
+            schedule_time_us, total_time_us,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
-        paged buffer. This is called from within attention layer to ensure
-        async copying from start_load_kv is complete.
+        paged buffer.
 
-        This interface will be useful for layer-by-layer pipelining.
+        NOTE: This is now a no-op since start_load_kv is fully synchronous.
+        All transfers are complete before start_load_kv returns.
 
         Args:
             layer_name: the name of that layer
         """
-        # Check if there are any load intents in current metadata
-        metadata = self._get_connector_metadata()
-        if not isinstance(metadata, PegaConnectorMetadata) or not metadata.load_intents:
-            return
-
-        if self._sync_state is not None and layer_name in self._layer_name_to_id:
-            layer_id = self._layer_name_to_id[layer_name]
-            self._sync_state.wait_layer(layer_id)
-            return
-
-        raise NotImplementedError("wait_for_layer_load through ZMQ not supported")
+        # Synchronous path: all loading done in start_load_kv
+        pass
 
     def save_kv_layer(
         self,
@@ -1205,10 +1204,6 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         self._registered_layers = list(kv_caches.keys())
 
-        # Create shared-memory sync state for async layer loading
-        self._sync_state = PyLayerSyncState(self._num_layers)
-        shm_name = self._sync_state.shm_name()
-
         # Build layer_name -> layer_id mapping
         self._layer_name_to_id.clear()
         for layer_id, layer_name in enumerate(kv_caches.keys()):
@@ -1252,13 +1247,12 @@ class PegaKVConnector(KVConnectorBase_V1):
                 'segments': segments,
                 'tp_size': self._tp_size,
                 'num_layers': self._num_layers,
-                'shm_name': shm_name,
                 'device_id': self._device_id,
             })
 
         logger.info(
-            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s shm=%s",
-            len(kv_caches), layout, self._instance_id, shm_name,
+            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
+            len(kv_caches), layout, self._instance_id,
         )
 
     def unregister_context(self) -> None:

@@ -49,7 +49,7 @@ def timing_wrapper(func):
         start = time.perf_counter()
         result = func(*args, **kwargs)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] %s took %.2f ms",
             func.__name__,
             elapsed_ms,

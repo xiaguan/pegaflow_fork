@@ -5,7 +5,7 @@ pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
-pub use sync_state::LayerSyncState;
+pub use sync_state::{LayerSyncState, LoadState};
 
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
@@ -29,12 +29,11 @@ pub use sync_state::LayerSyncState;
 // significantly improving PCIe bandwidth utilization compared to strided copies.
 // ============================================================================
 
-use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
+use cudarc::driver::{CudaContext, CudaStream};
 use std::{
     collections::HashMap,
     fmt,
     sync::{Arc, Mutex, RwLock},
-    time::Instant,
 };
 use tracing::{debug, info, instrument};
 
@@ -97,10 +96,6 @@ struct WorkerContext {
     kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
     /// Single stream for all transfers to ensure sequential execution
     stream: Arc<CudaStream>,
-    /// Track per-layer completion events for async loading
-    layer_events: Mutex<HashMap<String, CudaEvent>>,
-    /// Shared memory sync state for async layer loading (attached from connector)
-    sync_state: Mutex<Option<Arc<LayerSyncState>>>,
     /// Hold CUDA context for the lifetime of the inference context
     _cuda_ctx: Arc<CudaContext>,
     device_id: i32,
@@ -114,8 +109,6 @@ impl WorkerContext {
         Self {
             kv_caches: Mutex::new(HashMap::new()),
             stream,
-            layer_events: Mutex::new(HashMap::new()),
-            sync_state: Mutex::new(None),
             _cuda_ctx: cuda_ctx,
             device_id,
         }
@@ -133,21 +126,6 @@ impl WorkerContext {
 
     fn stream(&self) -> Arc<CudaStream> {
         self.stream.clone()
-    }
-
-    fn take_layer_event(&self, layer_name: &str) -> Option<CudaEvent> {
-        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
-        guard.remove(layer_name)
-    }
-
-    fn set_sync_state(&self, sync_state: Arc<LayerSyncState>) {
-        let mut guard = self.sync_state.lock().expect("sync_state lock poisoned");
-        *guard = Some(sync_state);
-    }
-
-    fn get_sync_state(&self) -> Option<Arc<LayerSyncState>> {
-        let guard = self.sync_state.lock().expect("sync_state lock poisoned");
-        guard.clone()
     }
 }
 
@@ -408,34 +386,6 @@ impl PegaEngine {
         Ok(())
     }
 
-    /// Attach a shared-memory sync state to a worker.
-    ///
-    /// The connector creates the sync state and passes the `shm_name` to the server.
-    /// The server then attaches to the same shared memory region.
-    #[instrument(level = "info", skip(self))]
-    pub fn attach_sync_state(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        shm_name: &str,
-        num_layers: usize,
-    ) -> Result<(), EngineError> {
-        let instance = self.get_instance(instance_id)?;
-        let worker = instance
-            .get_worker(tp_rank)
-            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
-
-        let sync_state = LayerSyncState::attach(shm_name, num_layers)
-            .map_err(|e| EngineError::Storage(format!("failed to attach sync state: {e:?}")))?;
-
-        worker.set_sync_state(Arc::new(sync_state));
-        info!(
-            "Attached sync state for instance {} rank {} (shm={})",
-            instance_id, tp_rank, shm_name
-        );
-        Ok(())
-    }
-
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
@@ -633,24 +583,13 @@ impl PegaEngine {
         Ok(hit_count)
     }
 
-    /// Batch load KV blocks for multiple layers with async completion notification.
+    /// Batch load KV blocks for multiple layers asynchronously.
     ///
-    /// This method:
-    /// 1. Looks up all block_hashes in storage ONCE
-    /// 2. Submits async transfers for ALL layers
-    /// 3. Spawns a background thread that waits for each layer's CUDA event
-    ///    and marks the corresponding flag in shared memory sync_state
+    /// This spawns a background thread to perform all transfers and waits via LoadState.
+    /// The function returns immediately after spawning the thread.
     ///
-    /// The connector can then use `wait_layer()` on the sync_state to wait
-    /// for each layer without ZMQ round-trips.
-    ///
-    /// Args:
-    ///   - layer_names: List of layer names to load
-    ///   - block_ids: GPU block IDs to load into (shared across all layers)
-    ///   - block_hashes: Content hashes for each block (shared across all layers)
-    ///
-    /// Returns:
-    ///   - Vec of (layer_name, bytes_transferred) for each successfully loaded layer
+    /// The connector creates a LoadState, passes the `load_state_shm` to this method,
+    /// and then spin-waits on the state until it becomes non-zero (1=success, -1=error).
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
@@ -660,227 +599,158 @@ impl PegaEngine {
         &self,
         instance_id: &str,
         tp_rank: usize,
+        load_state_shm: &str,
         layer_names: &[&str],
         block_ids: &[i32],
         block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<(String, usize)>, EngineError> {
-        let start_time = Instant::now();
+    ) -> Result<(), EngineError> {
+        // Attach to LoadState early so we can set error if something fails
+        let load_state = LoadState::attach(load_state_shm)
+            .map_err(|e| EngineError::Storage(format!("failed to attach LoadState: {e:?}")))?;
 
         let instance = self.get_instance(instance_id)?;
         let worker = instance
             .get_worker(tp_rank)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
 
-        let stream = worker.stream();
-        let sync_state = worker.get_sync_state();
-
-        // Reset sync_state flags if available
-        if let Some(ref ss) = sync_state {
-            ss.reset();
-        }
-
-        // Step 1: Lookup all block_hashes ONCE and cache the blocks
+        // Lookup all block_hashes ONCE and cache the blocks
         let shard_blocks_cache = self
             .storage
             .lookup_many(block_hashes)
             .map_err(EngineError::Storage)?;
 
-        // Step 2: Submit async transfers for ALL layers, collect events
-        let mut results = Vec::with_capacity(layer_names.len());
-        let mut layer_events: Vec<(usize, CudaEvent)> = Vec::with_capacity(layer_names.len());
+        // Clone data for thread
+        let layer_names: Vec<String> = layer_names.iter().map(|s| s.to_string()).collect();
+        let block_ids = block_ids.to_vec();
 
-        for layer_name in layer_names {
-            let layer_id = match instance.get_layer_id(layer_name) {
-                Some(id) => id,
-                None => {
-                    info!("Layer {} unknown in instance, skipping", layer_name);
-                    continue;
-                }
-            };
+        // Spawn background thread to do all work
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let stream = worker.stream();
+            let mut total_bytes = 0usize;
+            let mut total_blocks = 0usize;
 
-            let registration = match worker.get_registration(layer_name) {
-                Some(reg) => reg,
-                None => {
-                    info!("Layer {} not registered on worker, skipping", layer_name);
-                    continue;
-                }
-            };
+            for layer_name in &layer_names {
+                let layer_id = match instance.get_layer_id(layer_name) {
+                    Some(id) => id,
+                    None => continue,
+                };
 
-            let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
+                let registration = match worker.get_registration(layer_name) {
+                    Some(reg) => reg,
+                    None => continue,
+                };
 
-            // Collect valid blocks to load for this layer
-            let mut blocks_to_load = Vec::with_capacity(block_ids.len());
+                let slot_id = match instance.get_slot_index(layer_id, tp_rank) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
 
-            for (block_id, shard_blocks_arc) in block_ids.iter().zip(shard_blocks_cache.iter()) {
-                let block_idx = *block_id as usize;
+                // Collect valid blocks to load for this layer
+                let blocks_to_load: Vec<_> = block_ids
+                    .iter()
+                    .zip(shard_blocks_cache.iter())
+                    .filter_map(|(block_id, shard_blocks_arc)| {
+                        let block_idx = *block_id as usize;
+                        let blocks = shard_blocks_arc.lock_blocks();
+                        blocks
+                            .get(slot_id)
+                            .and_then(|opt| opt.as_ref())
+                            .map(|block| (block_idx, block.clone()))
+                    })
+                    .collect();
 
-                let blocks = shard_blocks_arc.lock_blocks();
-                if let Some(block) = blocks.get(slot_id).and_then(|opt| opt.as_ref()) {
-                    blocks_to_load.push((block_idx, block.clone()));
-                }
-            }
-
-            if blocks_to_load.is_empty() {
-                // Still record event and mark done immediately if no blocks
-                if let Ok(event) = stream.record_event(None) {
-                    layer_events.push((layer_id, event));
-                }
-                continue;
-            }
-
-            // Perform async transfer
-            let total_transfer;
-
-            // Optimize for layer-first layout with KV stride
-            if registration.segments == 2
-                && registration.kv_stride_bytes > registration.bytes_per_block
-            {
-                let segment_size = registration.bytes_per_block;
-
-                // Prepare K and V segments with their GPU destinations
-                let mut k_transfers = Vec::with_capacity(blocks_to_load.len());
-                let mut v_transfers = Vec::with_capacity(blocks_to_load.len());
-
-                for (block_idx, block) in &blocks_to_load {
-                    let k_gpu_offset = match transfer::segment_offset(&registration, *block_idx, 0)
-                    {
-                        Ok(offset) => offset,
-                        Err(e) => {
-                            info!("Failed to get K offset for layer {}: {}", layer_name, e);
-                            continue;
-                        }
-                    };
-                    let v_gpu_offset = match transfer::segment_offset(&registration, *block_idx, 1)
-                    {
-                        Ok(offset) => offset,
-                        Err(e) => {
-                            info!("Failed to get V offset for layer {}: {}", layer_name, e);
-                            continue;
-                        }
-                    };
-
-                    let k_cpu_ptr = block.k_ptr() as *const u8;
-                    let v_cpu_ptr = if let Some(v_ptr) = block.v_ptr() {
-                        v_ptr as *const u8
-                    } else {
-                        unsafe { k_cpu_ptr.add(segment_size) }
-                    };
-
-                    k_transfers.push((k_gpu_offset, k_cpu_ptr));
-                    v_transfers.push((v_gpu_offset, v_cpu_ptr));
-                }
-
-                // Batch copy K segments (async)
-                if let Err(e) = transfer::batch_copy_segments_to_gpu(
-                    &k_transfers,
-                    segment_size,
-                    &registration,
-                    &stream,
-                ) {
-                    info!("Failed to copy K segments for layer {}: {}", layer_name, e);
+                if blocks_to_load.is_empty() {
                     continue;
                 }
 
-                // Batch copy V segments (async)
-                if let Err(e) = transfer::batch_copy_segments_to_gpu(
-                    &v_transfers,
-                    segment_size,
-                    &registration,
-                    &stream,
-                ) {
-                    info!("Failed to copy V segments for layer {}: {}", layer_name, e);
-                    continue;
-                }
+                if registration.segments == 2
+                    && registration.kv_stride_bytes > registration.bytes_per_block
+                {
+                    // Optimized path for layer-first layout with KV stride
+                    let segment_size = registration.bytes_per_block;
 
-                total_transfer = blocks_to_load.len() * segment_size * 2;
-            } else {
-                // Original logic for contiguous or single-segment layouts
-                let mut transfer_size = 0;
-                for (block_idx, block) in blocks_to_load {
-                    match transfer::copy_block_cpu_to_gpu(
+                    let (k_transfers, v_transfers): (Vec<_>, Vec<_>) = blocks_to_load
+                        .iter()
+                        .map(|(block_idx, block)| {
+                            let k_gpu_offset =
+                                transfer::segment_offset(&registration, *block_idx, 0)
+                                    .expect("K segment offset should be valid");
+                            let v_gpu_offset =
+                                transfer::segment_offset(&registration, *block_idx, 1)
+                                    .expect("V segment offset should be valid");
+
+                            let k_cpu_ptr = block.k_ptr() as *const u8;
+                            let v_cpu_ptr = block
+                                .v_ptr()
+                                .map(|p| p as *const u8)
+                                .unwrap_or_else(|| unsafe { k_cpu_ptr.add(segment_size) });
+
+                            ((k_gpu_offset, k_cpu_ptr), (v_gpu_offset, v_cpu_ptr))
+                        })
+                        .unzip();
+
+                    transfer::batch_copy_segments_to_gpu(
+                        &k_transfers,
+                        segment_size,
                         &registration,
-                        block_idx,
-                        block.k_ptr() as *const u8,
                         &stream,
-                    ) {
-                        Ok(_) => {
-                            transfer_size += block.size();
-                        }
-                        Err(e) => {
-                            info!(
-                                "Failed to copy block {} for layer {}: {}",
-                                block_idx, layer_name, e
-                            );
-                        }
+                    )
+                    .expect("K segment batch copy should succeed");
+                    transfer::batch_copy_segments_to_gpu(
+                        &v_transfers,
+                        segment_size,
+                        &registration,
+                        &stream,
+                    )
+                    .expect("V segment batch copy should succeed");
+
+                    total_bytes += blocks_to_load.len() * segment_size * 2;
+                    total_blocks += blocks_to_load.len();
+                } else {
+                    // Contiguous or single-segment layouts
+                    for (block_idx, block) in &blocks_to_load {
+                        transfer::copy_block_cpu_to_gpu(
+                            &registration,
+                            *block_idx,
+                            block.k_ptr() as *const u8,
+                            &stream,
+                        )
+                        .expect("Block copy should succeed");
+                        total_bytes += block.size();
                     }
+                    total_blocks += blocks_to_load.len();
                 }
-                total_transfer = transfer_size;
             }
 
-            // Record event for this layer (after all transfers for this layer are queued)
-            match stream.record_event(None) {
-                Ok(event) => {
-                    layer_events.push((layer_id, event));
-                }
-                Err(e) => {
-                    info!(
-                        "Failed to record CUDA event for layer {}: {:?}",
-                        layer_name, e
-                    );
-                }
+            // Record event and wait for all transfers
+            let final_event = stream
+                .record_event(None)
+                .expect("failed to record final event");
+
+            if let Err(e) = final_event.synchronize() {
+                info!("Failed to sync final event: {:?}", e);
+                load_state.set_error();
+                return;
             }
 
-            results.push((layer_name.to_string(), total_transfer));
-        }
+            let elapsed = start.elapsed();
+            let bandwidth_gbps = if elapsed.as_secs_f64() > 0.0 {
+                (total_bytes as f64 / 1e9) / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
 
-        // Step 3: Spawn background thread to wait for events and mark sync_state
-        if let Some(sync_state) = sync_state {
-            std::thread::spawn(move || {
-                let start = std::time::Instant::now();
+            info!(
+                "Transfers complete: {} blocks, {:.2} MB in {:?} ({:.2} GB/s)",
+                total_blocks,
+                total_bytes as f64 / 1e6,
+                elapsed,
+                bandwidth_gbps
+            );
+            load_state.set_completed();
+        });
 
-                for (layer_id, event) in layer_events {
-                    // Wait for this layer's transfer to complete
-                    if let Err(e) = event.synchronize() {
-                        info!("Failed to sync event for layer {}: {:?}", layer_id, e);
-                    }
-                    // Mark layer as done in shared memory
-                    sync_state.mark_layer_done(layer_id);
-                }
-
-                let elapsed = start.elapsed();
-                info!("All layers synchronized in {:?} ", elapsed);
-            });
-        }
-
-        let total_elapsed = (Instant::now() - start_time).as_secs_f64();
-        info!(
-            "batch_load_kv_blocks_multi_layer: submitted {} layers in {:.3}s",
-            results.len(),
-            total_elapsed
-        );
-
-        Ok(results)
-    }
-
-    /// Block until the most recent async transfer for a layer finishes.
-    pub fn wait_for_layer_transfer(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        layer_name: &str,
-    ) -> Result<(), EngineError> {
-        let instance = self.get_instance(instance_id)?;
-        let worker = instance
-            .get_worker(tp_rank)
-            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
-
-        let event = worker.take_layer_event(layer_name);
-
-        if let Some(event) = event {
-            event.synchronize().map_err(|e| {
-                EngineError::Storage(format!("failed to sync layer {layer_name}: {e:?}"))
-            })?;
-        }
         Ok(())
     }
 }

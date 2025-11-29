@@ -1,6 +1,6 @@
 use std::sync::{Arc, Once};
 
-use pega_core::{LayerSyncState, PegaEngine as CoreEngine};
+use pega_core::{LoadState, PegaEngine as CoreEngine};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
@@ -151,23 +151,7 @@ impl PegaEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-    /// Wait until the async transfer for `layer_name` completes.
-    fn wait_for_layer_transfer(
-        &self,
-        py: Python<'_>,
-        instance_id: &str,
-        tp_rank: usize,
-        layer_name: String,
-    ) -> PyResult<()> {
-        let instance_id_owned = instance_id.to_string();
-        let engine = &self.engine;
-        py.allow_threads(move || {
-            engine.wait_for_layer_transfer(&instance_id_owned, tp_rank, &layer_name)
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
-
-    /// Batch load KV blocks for multiple layers using the same block mapping
+    /// Batch load KV blocks for multiple layers using the same block mapping.
     ///
     /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop
     /// from Python, as it avoids Python overhead, data copying, and redundant hash lookups.
@@ -178,6 +162,7 @@ impl PegaEngine {
     /// Args:
     ///     instance_id: ID of the model instance
     ///     tp_rank: Tensor Parallel rank of the worker
+    ///     load_state_shm: Shared memory name from PyLoadState.shm_name() for sync
     ///     layer_names: List of layer names to load
     ///     block_ids: GPU block IDs to load into (list of ints)
     ///     block_hashes: Content hashes for each block (list of bytes)
@@ -186,75 +171,51 @@ impl PegaEngine {
         py: Python<'_>,
         instance_id: &str,
         tp_rank: usize,
+        load_state_shm: &str,
         layer_names: Vec<String>,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<(usize, usize)> {
+    ) -> PyResult<()> {
         let instance_id_owned = instance_id.to_string();
+        let load_state_shm_owned = load_state_shm.to_string();
         let engine = &self.engine;
         py.allow_threads(move || {
             let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
-            engine
-                .batch_load_kv_blocks_multi_layer(
-                    &instance_id_owned,
-                    tp_rank,
-                    &layer_name_refs,
-                    &block_ids,
-                    &block_hashes,
-                )
-                .map(|results| {
-                    let total_layers = results.len();
-                    let total_bytes = results.iter().map(|(_, bytes)| bytes).sum();
-                    (total_layers, total_bytes)
-                })
+            engine.batch_load_kv_blocks_multi_layer(
+                &instance_id_owned,
+                tp_rank,
+                &load_state_shm_owned,
+                &layer_name_refs,
+                &block_ids,
+                &block_hashes,
+            )
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
-
-    /// Attach a shared-memory sync state to a worker.
-    ///
-    /// The connector creates the sync state and passes the shm_name to the server.
-    /// The server then attaches to the same shared memory region and uses it
-    /// to signal layer completion without ZMQ round-trips.
-    ///
-    /// Args:
-    ///     instance_id: ID of the model instance
-    ///     tp_rank: Tensor Parallel rank of the worker
-    ///     shm_name: Shared memory name from PyLayerSyncState.shm_name()
-    ///     num_layers: Number of layers in the model
-    fn attach_sync_state(
-        &self,
-        instance_id: &str,
-        tp_rank: usize,
-        shm_name: &str,
-        num_layers: usize,
-    ) -> PyResult<()> {
-        self.engine
-            .attach_sync_state(instance_id, tp_rank, shm_name, num_layers)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    }
 }
 
-/// Python wrapper for LayerSyncState (shared-memory sync state for async layer loading)
+/// Python wrapper for LoadState (batch-level sync for async KV cache loading)
 ///
-/// Created by connector worker, passes shm_name to server.
-/// Then connector uses wait_layer() to spin-wait for layer completion.
+/// Created by connector worker before starting a load batch.
+/// Pass shm_name() to the server, then use wait() to spin-wait for completion.
+///
+/// State values:
+/// - 0: pending (load in progress)
+/// - 1: success (all transfers complete)
+/// - <0: error (transfer failed)
 #[pyclass]
-struct PyLayerSyncState {
-    inner: Arc<LayerSyncState>,
+struct PyLoadState {
+    inner: Arc<LoadState>,
 }
 
 #[pymethods]
-impl PyLayerSyncState {
-    /// Create a new LayerSyncState with the given number of layers.
-    ///
-    /// Args:
-    ///     num_layers: Number of layers in the model
+impl PyLoadState {
+    /// Create a new LoadState (creates shared memory, initializes to PENDING).
     #[new]
-    fn new(num_layers: usize) -> PyResult<Self> {
-        let inner = LayerSyncState::new(num_layers)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create sync state: {e:?}")))?;
+    fn new() -> PyResult<Self> {
+        let inner = LoadState::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create LoadState: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -265,29 +226,23 @@ impl PyLayerSyncState {
         self.inner.shm_name().to_string()
     }
 
-    /// Get the number of layers.
-    fn num_layers(&self) -> usize {
-        self.inner.num_layers()
-    }
-
-    /// Reset all flags to NOT_STARTED (call before starting a new load batch).
+    /// Reset state to PENDING (call before starting a new load batch).
     fn reset(&self) {
         self.inner.reset();
     }
 
-    /// Wait until a layer is completed (spin-wait).
+    /// Get current state value (non-blocking).
     ///
-    /// Args:
-    ///     layer_id: The layer ID to wait for (0-indexed)
-    fn wait_layer(&self, py: Python<'_>, layer_id: usize) {
-        py.allow_threads(|| {
-            self.inner.wait_layer(layer_id);
-        });
+    /// Returns: 0=pending, 1=success, <0=error
+    fn get(&self) -> i64 {
+        self.inner.get()
     }
 
-    /// Check if a layer is completed (non-blocking).
-    fn is_layer_done(&self, layer_id: usize) -> bool {
-        self.inner.is_layer_done(layer_id)
+    /// Spin-wait until state becomes non-zero (completed or error).
+    ///
+    /// Returns the final state value (1 for success, <0 for error).
+    fn wait(&self, py: Python<'_>) -> i64 {
+        py.allow_threads(|| self.inner.wait())
     }
 }
 
@@ -297,6 +252,6 @@ impl PyLayerSyncState {
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
     m.add_class::<PegaEngine>()?;
-    m.add_class::<PyLayerSyncState>()?;
+    m.add_class::<PyLoadState>()?;
     Ok(())
 }

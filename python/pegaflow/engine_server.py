@@ -182,7 +182,6 @@ class PegaEngineServer:
                 'tp_rank': int,
                 'tp_size': int,
                 'num_layers': int,
-                'shm_name': str,  # shared memory name for sync state
             }
 
         Returns:
@@ -203,9 +202,6 @@ class PegaEngineServer:
             # Topology info
             tp_size = payload['tp_size']
             num_layers = payload['num_layers']
-
-            # Shared memory name for sync state (optional for backward compatibility)
-            shm_name = payload.get('shm_name')
 
             # Use (instance_id, tp_rank) as key for keeping tensors alive in Python process
             context_key = f"{instance_id}:tp{tp_rank}"
@@ -239,15 +235,6 @@ class PegaEngineServer:
                 tp_size,
                 num_layers,
             )
-
-            # Attach sync state if shm_name is provided
-            # This allows the Rust engine to signal layer completion via shared memory
-            if shm_name:
-                self.engine.attach_sync_state(instance_id, tp_rank, shm_name, num_layers)
-                logger.info(
-                    "Attached sync state for instance %s rank %d (shm=%s)",
-                    instance_id, tp_rank, shm_name
-                )
 
             logger.info(
                 "Registered layer '%s' for instance %s rank %d (device %d): ptr=0x%x",
@@ -322,44 +309,38 @@ class PegaEngineServer:
 
         Args:
             payload: {
+                'load_state_shm': str,  # shared memory name for LoadState sync
                 'layer_names': list[str],
                 'block_ids': list[int],
                 'block_hashes': list[bytes],
             }
 
         Returns:
-            {
-                'status': 'success',
-                'num_layers_loaded': int,
-                'total_bytes': int,
-            }
-            or {'status': 'error', 'message': str}
+            {'status': 'success'} or {'status': 'error', 'message': str}
         """
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
+            load_state_shm = payload['load_state_shm']
             layer_names = payload['layer_names']
             block_ids = payload['block_ids']
             block_hashes = payload['block_hashes']
 
-            num_layers_loaded, total_bytes = self.engine.batch_load_kv_blocks(
+            self.engine.batch_load_kv_blocks(
                 instance_id,
                 tp_rank,
+                load_state_shm,
                 layer_names,
                 block_ids,
                 block_hashes
             )
 
             logger.debug(
-                "Loaded %d blocks across %d layers (%d bytes) for instance %s rank %d",
-                len(block_ids), num_layers_loaded, total_bytes, instance_id, tp_rank
+                "Submitted load for %d blocks across %d layers for instance %s rank %d",
+                len(block_ids), len(layer_names), instance_id, tp_rank
             )
 
-            return {
-                'status': 'success',
-                'num_layers_loaded': num_layers_loaded,
-                'total_bytes': total_bytes,
-            }
+            return {'status': 'success'}
 
         except Exception as e:
             logger.error("Failed to load blocks: %s", e, exc_info=True)
@@ -391,38 +372,17 @@ class PegaEngineServer:
             logger.error("Failed to query blocks: %s", e, exc_info=True)
             return {'status': 'error', 'message': str(e)}
 
-    def _handle_wait_layer(self, payload: dict) -> dict:
-        """Handle WAIT_LAYER command - wait for layer transfer.
-
-        Args:
-            payload: {
-                'layer_name': str,
-            }
-
-        Returns:
-            {'status': 'success'} or {'status': 'error', 'message': str}
-        """
-        try:
-            instance_id = self._require_instance_id(payload)
-            tp_rank = self._require_tp_rank(payload)
-            layer_name = payload['layer_name']
-            self.engine.wait_for_layer_transfer(instance_id, tp_rank, layer_name)
-            return {'status': 'success'}
-        except Exception as e:
-            logger.error("Failed to wait for layer: %s", e, exc_info=True)
-            return {'status': 'error', 'message': str(e)}
-
     def _handle_shutdown(self, payload: dict) -> dict:
         """Handle SHUTDOWN command - graceful shutdown."""
         logger.info("Received shutdown command")
         for context_key in list(self._contexts.keys()):
             self._drop_context(context_key)
-        
+
         # Unregister all instances from engine
-        # (We don't have a method to list all instances from engine, 
+        # (We don't have a method to list all instances from engine,
         # but we cleared Python-side contexts. Rust side might still have data.
         # Ideally we should clear engine too, but maybe not needed for hard shutdown)
-        
+
         self.running = False
         return {'status': 'success'}
 
@@ -454,8 +414,6 @@ class PegaEngineServer:
                     response = self._handle_load(payload)
                 elif command == 'QUERY':
                     response = self._handle_query(payload)
-                elif command == 'WAIT_LAYER':
-                    response = self._handle_wait_layer(payload)
                 elif command == 'SHUTDOWN':
                     response = self._handle_shutdown(payload)
                 else:
