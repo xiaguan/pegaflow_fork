@@ -5,7 +5,7 @@ pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
-pub use sync_state::{LayerSyncState, LoadState};
+pub use sync_state::LoadState;
 
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.

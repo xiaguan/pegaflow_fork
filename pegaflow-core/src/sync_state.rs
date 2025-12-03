@@ -1,244 +1,205 @@
 //! Shared-memory synchronization state for async KV cache loading.
 //!
-//! This module provides two synchronization primitives:
-//!
-//! 1. `LayerSyncState` - Per-layer sync for layer-by-layer pipelining (legacy)
-//! 2. `LoadState` - Batch-level sync for simpler synchronous waiting
-//!
-//! # Architecture (LoadState - recommended)
-//!
-//! ```text
-//! Connector Worker                    Engine Server (async thread)
-//! ─────────────────                   ────────────────────────────
-//! create LoadState ──shm_name──▶      attach LoadState
-//!
-//! spin-wait on state ◄─────────────── set_completed() or set_error()
-//! ```
+//! Only the batch-level `LoadState` is supported. Other platforms are not
+//! supported; compilation will fail outside x86_64 Linux.
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+compile_error!("LoadState is only supported on x86_64 Linux");
 
 use shared_memory::{Shmem, ShmemConf, ShmemError};
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::{
+    alloc::Layout,
+    ptr::NonNull,
+    sync::atomic::{AtomicI64, AtomicU32, Ordering},
+};
 use uuid::Uuid;
 
-/// Flag values for layer synchronization state
-const FLAG_NOT_STARTED: u8 = 0;
-const FLAG_COMPLETED: u8 = 1;
-
-/// State values for LoadState
+/// State values for LoadState.
 pub const LOAD_STATE_PENDING: i64 = 0;
 pub const LOAD_STATE_SUCCESS: i64 = 1;
 pub const LOAD_STATE_ERROR: i64 = -1;
 
-/// Batch-level synchronization state for async KV cache loading.
-///
-/// Much simpler than LayerSyncState - just a single atomic i64:
-/// - 0: pending (load in progress)
-/// - 1: success (all transfers complete)
-/// - <0: error (transfer failed)
-///
-/// The connector creates this, passes the `shm_name` to the server,
-/// and then spin-waits on the state until it becomes non-zero.
-pub struct LoadState {
-    shmem: Shmem,
+/// Magic and version for LoadState header validation.
+const LOAD_STATE_MAGIC: u32 = 0x5046_4c44; // 'PFLD'
+pub const LOAD_STATE_VERSION: u32 = 1;
+
+/// Bytes reserved at the start of the mapping to store the aligned offset.
+const LOAD_STATE_META_SIZE: usize = std::mem::size_of::<usize>();
+// Only support 64-bit systems for now.
+const _: () = assert!(std::mem::size_of::<usize>() == 8);
+
+#[repr(C)]
+struct LoadStateHeader {
+    magic: AtomicU32,
+    version: AtomicU32,
 }
 
-// SAFETY: LoadState uses atomic operations for cross-process synchronization.
+/// In-memory layout for LoadState.
+#[repr(C, align(8))]
+struct LoadStateMem {
+    header: LoadStateHeader,
+    state: AtomicI64,
+}
+
+/// Batch-level synchronization state for async KV cache loading.
+///
+/// The connector creates this, passes the `shm_name` to the server, and
+/// periodically polls `get()` to see whether the async load completed.
+pub struct LoadState {
+    shmem: Shmem,
+    ptr: NonNull<LoadStateMem>,
+}
+
+// SAFETY: LoadState accesses shared memory exclusively through atomic fields.
+// The pointer is validated for alignment and size on creation/attach.
 unsafe impl Send for LoadState {}
 unsafe impl Sync for LoadState {}
 
 impl LoadState {
     /// Create a new LoadState (creates shared memory).
     ///
-    /// The state is initialized to PENDING (0).
+    /// The state is initialized to PENDING (0) and the header is stamped with
+    /// a magic value and version for validation when attaching.
     pub fn new() -> Result<Self, ShmemError> {
         let shm_name = format!("pega_load_{}", Uuid::new_v4().as_simple());
-        let size = std::mem::size_of::<AtomicI64>();
+        let shmem = ShmemConf::new()
+            .os_id(&shm_name)
+            .size(load_state_allocation_size())
+            .create()?;
 
-        let shmem = ShmemConf::new().os_id(&shm_name).size(size).create()?;
+        let ptr = init_new_mapping(&shmem)?;
+        let mem = unsafe { ptr.as_ref() };
+        mem.header.magic.store(LOAD_STATE_MAGIC, Ordering::Release);
+        mem.header
+            .version
+            .store(LOAD_STATE_VERSION, Ordering::Release);
+        mem.state.store(LOAD_STATE_PENDING, Ordering::Release);
 
-        // Initialize to PENDING
-        let ptr = shmem.as_ptr() as *mut AtomicI64;
-        unsafe {
-            (*ptr).store(LOAD_STATE_PENDING, Ordering::Relaxed);
-        }
-
-        Ok(Self { shmem })
+        Ok(Self { shmem, ptr })
     }
 
     /// Attach to an existing LoadState by shared memory name.
     pub fn attach(shm_name: &str) -> Result<Self, ShmemError> {
         let shmem = ShmemConf::new().os_id(shm_name).open()?;
+        let ptr = attach_mapping(&shmem)?;
+        let mem = unsafe { ptr.as_ref() };
+        validate_header(mem)?;
 
-        if shmem.len() < std::mem::size_of::<AtomicI64>() {
-            return Err(ShmemError::MapSizeZero);
-        }
-
-        Ok(Self { shmem })
+        Ok(Self { shmem, ptr })
     }
 
     /// Get the shared memory identifier.
     pub fn shm_name(&self) -> &str {
         self.shmem.get_os_id()
-    }
-
-    /// Reset state to PENDING. Call before starting a new load batch.
-    pub fn reset(&self) {
-        let ptr = self.shmem.as_ptr() as *mut AtomicI64;
-        unsafe {
-            (*ptr).store(LOAD_STATE_PENDING, Ordering::Release);
-        }
     }
 
     /// Get current state value (non-blocking).
     pub fn get(&self) -> i64 {
-        let ptr = self.shmem.as_ptr() as *const AtomicI64;
-        unsafe { (*ptr).load(Ordering::Acquire) }
+        self.mem().state.load(Ordering::Acquire)
     }
 
     /// Set state to SUCCESS (1). Called by server when all transfers complete.
     pub fn set_completed(&self) {
-        let ptr = self.shmem.as_ptr() as *mut AtomicI64;
-        unsafe {
-            (*ptr).store(LOAD_STATE_SUCCESS, Ordering::Release);
-        }
+        self.mem()
+            .state
+            .store(LOAD_STATE_SUCCESS, Ordering::Release);
     }
 
     /// Set state to ERROR (-1). Called by server on transfer failure.
     pub fn set_error(&self) {
-        let ptr = self.shmem.as_ptr() as *mut AtomicI64;
-        unsafe {
-            (*ptr).store(LOAD_STATE_ERROR, Ordering::Release);
-        }
+        self.mem().state.store(LOAD_STATE_ERROR, Ordering::Release);
     }
 
-    /// Spin-wait until state becomes non-zero (completed or error).
-    ///
-    /// Returns the final state value (1 for success, <0 for error).
-    pub fn wait(&self) -> i64 {
-        let ptr = self.shmem.as_ptr() as *const AtomicI64;
-        loop {
-            let state = unsafe { (*ptr).load(Ordering::Acquire) };
-            if state != LOAD_STATE_PENDING {
-                return state;
-            }
-            std::hint::spin_loop();
-        }
+    fn mem(&self) -> &LoadStateMem {
+        // SAFETY: `ptr` is validated for size/alignment on creation/attach,
+        // and the underlying memory lives for the lifetime of `shmem`.
+        unsafe { self.ptr.as_ref() }
     }
 }
 
-/// Shared-memory based synchronization state for async layer loading.
-///
-/// The connector creates this, passes the `shm_name` to the server,
-/// and the server attaches to the same shared memory region.
-///
-/// NOTE: This is the legacy per-layer sync mechanism. Consider using
-/// LoadState for simpler batch-level synchronization.
-pub struct LayerSyncState {
-    shmem: Shmem,
-    num_layers: usize,
+fn load_state_layout() -> Layout {
+    Layout::new::<LoadStateMem>()
 }
 
-// SAFETY: LayerSyncState uses atomic operations for cross-process synchronization.
-// The shared memory region is accessed via atomic operations only.
-unsafe impl Send for LayerSyncState {}
-unsafe impl Sync for LayerSyncState {}
+fn load_state_allocation_size() -> usize {
+    let layout = load_state_layout();
+    LOAD_STATE_META_SIZE + layout.size() + layout.align()
+}
 
-impl LayerSyncState {
-    /// Create a new LayerSyncState with the given number of layers.
-    ///
-    /// This creates a new shared memory region with a unique name.
-    /// The name can be retrieved via `shm_name()` and passed to the server.
-    pub fn new(num_layers: usize) -> Result<Self, ShmemError> {
-        let shm_name = format!("pega_sync_{}", Uuid::new_v4().as_simple());
-        let size = num_layers;
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    debug_assert!(align.is_power_of_two());
+    let mask = align - 1;
+    value.checked_add(mask).map(|v| v & !mask)
+}
 
-        let shmem = ShmemConf::new().os_id(&shm_name).size(size).create()?;
-
-        // Initialize all flags to NOT_STARTED
-        let ptr = shmem.as_ptr() as *mut AtomicU8;
-        for i in 0..num_layers {
-            unsafe {
-                (*ptr.add(i)).store(FLAG_NOT_STARTED, Ordering::Relaxed);
-            }
-        }
-
-        Ok(Self { shmem, num_layers })
+fn init_new_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, ShmemError> {
+    let layout = load_state_layout();
+    if shmem.len() < LOAD_STATE_META_SIZE + layout.size() {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Attach to an existing shared memory region by name.
-    ///
-    /// Used by the server to attach to the region created by the connector.
-    pub fn attach(shm_name: &str, num_layers: usize) -> Result<Self, ShmemError> {
-        let shmem = ShmemConf::new().os_id(shm_name).open()?;
+    let base = shmem.as_ptr() as usize;
+    let aligned = align_up(
+        base.checked_add(LOAD_STATE_META_SIZE)
+            .ok_or(ShmemError::MapSizeZero)?,
+        layout.align(),
+    )
+    .ok_or(ShmemError::MapSizeZero)?;
+    let offset = aligned.checked_sub(base).ok_or(ShmemError::MapSizeZero)?;
 
-        if shmem.len() < num_layers {
-            return Err(ShmemError::MapSizeZero);
-        }
-
-        Ok(Self { shmem, num_layers })
+    if offset
+        .checked_add(layout.size())
+        .map_or(true, |end| end > shmem.len())
+    {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Get the shared memory identifier.
-    ///
-    /// Pass this to the server so it can attach to the same region.
-    pub fn shm_name(&self) -> &str {
-        self.shmem.get_os_id()
+    // Record the offset so attach() can find the aligned region.
+    unsafe {
+        (shmem.as_ptr() as *mut usize).write_unaligned(offset);
     }
 
-    /// Get the number of layers.
-    pub fn num_layers(&self) -> usize {
-        self.num_layers
+    if aligned % layout.align() != 0 {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Reset all flags to NOT_STARTED.
-    ///
-    /// Call this before starting a new load batch.
-    pub fn reset(&self) {
-        let ptr = self.shmem.as_ptr() as *mut AtomicU8;
-        for i in 0..self.num_layers {
-            unsafe {
-                (*ptr.add(i)).store(FLAG_NOT_STARTED, Ordering::Release);
-            }
-        }
+    NonNull::new(aligned as *mut LoadStateMem).ok_or(ShmemError::MapSizeZero)
+}
+
+fn attach_mapping(shmem: &Shmem) -> Result<NonNull<LoadStateMem>, ShmemError> {
+    let layout = load_state_layout();
+    if shmem.len() < LOAD_STATE_META_SIZE + layout.size() {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Mark a layer as completed.
-    ///
-    /// Called by the server's async thread after the CUDA transfer is done.
-    pub fn mark_layer_done(&self, layer_id: usize) {
-        if layer_id >= self.num_layers {
-            return;
-        }
-        let ptr = self.shmem.as_ptr() as *mut AtomicU8;
-        unsafe {
-            (*ptr.add(layer_id)).store(FLAG_COMPLETED, Ordering::Release);
-        }
+    let base = shmem.as_ptr() as usize;
+    let offset = unsafe { (shmem.as_ptr() as *const usize).read_unaligned() };
+
+    if offset < LOAD_STATE_META_SIZE {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Wait until a layer is completed.
-    ///
-    /// Called by the connector worker before executing attention for that layer.
-    /// Uses spin-wait for simplicity.
-    pub fn wait_layer(&self, layer_id: usize) {
-        if layer_id >= self.num_layers {
-            return;
-        }
-        let ptr = self.shmem.as_ptr() as *const AtomicU8;
-        loop {
-            let flag = unsafe { (*ptr.add(layer_id)).load(Ordering::Acquire) };
-            if flag == FLAG_COMPLETED {
-                return;
-            }
-            std::hint::spin_loop();
-        }
+    let ptr_addr = base.checked_add(offset).ok_or(ShmemError::MapSizeZero)?;
+
+    if ptr_addr
+        .checked_add(layout.size())
+        .map_or(true, |end| end > shmem.len())
+    {
+        return Err(ShmemError::MapSizeZero);
     }
 
-    /// Check if a layer is completed (non-blocking).
-    pub fn is_layer_done(&self, layer_id: usize) -> bool {
-        if layer_id >= self.num_layers {
-            return true;
-        }
-        let ptr = self.shmem.as_ptr() as *const AtomicU8;
-        let flag = unsafe { (*ptr.add(layer_id)).load(Ordering::Acquire) };
-        flag == FLAG_COMPLETED
+    if ptr_addr % layout.align() != 0 {
+        return Err(ShmemError::MapSizeZero);
     }
+
+    NonNull::new(ptr_addr as *mut LoadStateMem).ok_or(ShmemError::MapSizeZero)
+}
+
+fn validate_header(mem: &LoadStateMem) -> Result<(), ShmemError> {
+    let magic = mem.header.magic.load(Ordering::Acquire);
+    let version = mem.header.version.load(Ordering::Acquire);
+    if magic != LOAD_STATE_MAGIC || version != LOAD_STATE_VERSION {
+        return Err(ShmemError::MapSizeZero);
+    }
+    Ok(())
 }

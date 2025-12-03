@@ -531,7 +531,7 @@ impl EngineRpcClient {
 /// Python wrapper for LoadState (batch-level sync for async KV cache loading)
 ///
 /// Created by connector worker before starting a load batch.
-/// Pass shm_name() to the server, then use wait() to spin-wait for completion.
+/// Pass shm_name() to the server, then poll via get()/is_ready() for completion.
 ///
 /// State values:
 /// - 0: pending (load in progress)
@@ -559,19 +559,9 @@ impl PyLoadState {
         self.inner.shm_name().to_string()
     }
 
-    /// Reset state to PENDING (call before starting a new load batch).
-    fn reset(&self) {
-        self.inner.reset();
-    }
-
     /// Get current state value (non-blocking).
     ///
     /// Returns: 0=pending, 1=success, <0=error
-    fn get(&self) -> i64 {
-        self.inner.get()
-    }
-
-    /// Alias for get() - used by connector for clarity.
     fn get_state(&self) -> i64 {
         self.inner.get()
     }
@@ -581,13 +571,6 @@ impl PyLoadState {
     /// Returns True if state is non-zero (completed or error).
     fn is_ready(&self) -> bool {
         self.inner.get() != 0
-    }
-
-    /// Spin-wait until state becomes non-zero (completed or error).
-    ///
-    /// Returns the final state value (1 for success, <0 for error).
-    fn wait(&self, py: Python<'_>) -> i64 {
-        py.allow_threads(|| self.inner.wait())
     }
 }
 
