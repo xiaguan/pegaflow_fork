@@ -17,9 +17,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import msgpack
 import torch
-import zmq
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -30,7 +28,7 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.logging_utils import get_connector_logger, timing_wrapper
-from pegaflow.pegaflow import PyLoadState
+from pegaflow.pegaflow import PyLoadState, EngineRpcClient
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -56,8 +54,8 @@ if TYPE_CHECKING:
 
 logger = get_connector_logger()
 
-# Engine server endpoint (independent process)
-_ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "ipc:///tmp/pega_engine.sock")
+# Engine server endpoint (gRPC URL)
+_ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "http://127.0.0.1:50055")
 
 
 # ==============================================================================
@@ -526,11 +524,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._tp_size, self._num_layers,
         )
 
-        # ZMQ client for connecting to engine server
+        # gRPC client for connecting to engine server
         self._engine_endpoint = _ENGINE_ENDPOINT
-        self._engine_context: Optional[zmq.Context] = None
-        self._engine_socket = None
-        self._engine_lock = threading.Lock()
+        self._engine_client = EngineRpcClient(self._engine_endpoint)
+        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
         # Async save worker
         self._save_queue = queue.Queue()
@@ -569,58 +566,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._pending_load_reqs: Dict[str, set[str]] = {}  # load_state.shm_name -> set of req_ids
         self._load_completion_lock = threading.Lock()
 
-    # ==============================
-    # Engine client helper methods
-    # ==============================
-
-    def _ensure_engine_socket(self) -> None:
-        """Ensure engine socket is connected."""
-        if self._engine_socket is not None:
-            return
-
-        if self._engine_context is None:
-            self._engine_context = zmq.Context()
-
-        self._engine_socket = self._engine_context.socket(zmq.REQ)
-        self._engine_socket.setsockopt(zmq.RCVTIMEO, 20000)
-        self._engine_socket.setsockopt(zmq.SNDTIMEO, 20000)
-        self._engine_socket.connect(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
-
-    def _send_engine_request(self, command: str, payload: dict) -> dict:
-        """Send request to engine server and get response."""
-        # Prepare payload
-        payload = dict(payload)
-        payload.setdefault("instance_id", self._instance_id)
-        if self._tp_rank is not None:
-            payload.setdefault("tp_rank", self._tp_rank)
-        if self._device_id is not None:
-            payload.setdefault("device_id", self._device_id)
-
-        with self._engine_lock:
-            self._ensure_engine_socket()
-            return self._zmq_send_recv(self._engine_socket, command, payload)
-
-    def _zmq_send_recv(self, socket: zmq.Socket, command: str, payload: dict) -> dict:
-        """Helper for ZMQ send/recv logic."""
-        command_bytes = msgpack.packb(command)
-        payload_bytes = msgpack.packb(payload, use_bin_type=True)
-        socket.send_multipart([command_bytes, payload_bytes])
-
-        response_parts = socket.recv_multipart()
-        assert len(response_parts) == 1, f"Invalid response format: expected 1 part, got {len(response_parts)}"
-
-        response = msgpack.unpackb(response_parts[0], raw=False)
-        assert response.get('status') == 'success', f"Engine request failed: {response.get('message', 'Unknown error')}"
-        return response
 
     def _save_worker(self) -> None:
         """Background worker for handling async save requests with batching."""
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.RCVTIMEO, 20000)
-        socket.setsockopt(zmq.SNDTIMEO, 20000)
-        socket.connect(self._engine_endpoint)
         logger.info("[PegaKVConnector] Save worker thread started")
 
         try:
@@ -638,7 +586,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                         t = self._save_queue.get_nowait()
                         if t is None:
                             # Got shutdown signal, process batch then exit
-                            self._process_save_batch(batch, socket)
+                            self._process_save_batch(batch)
                             self._save_queue.task_done()
                             return
                         batch.append(t)
@@ -646,7 +594,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                         break
 
                 try:
-                    self._process_save_batch(batch, socket)
+                    self._process_save_batch(batch)
                 except Exception as e:
                     logger.error(f"[PegaKVConnector] Save worker error: {e}", exc_info=True)
                     self._save_exception = e
@@ -659,12 +607,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             logger.critical(f"[PegaKVConnector] Save worker crashed: {e}", exc_info=True)
             self._save_exception = e
         finally:
-            socket.close()
-            context.term()
             logger.info("[PegaKVConnector] Save worker thread stopped")
 
-    def _process_save_batch(self, batch: list[dict], socket: zmq.Socket) -> None:
-        """Process a batch of save tasks, sending them in a single request."""
+    def _process_save_batch(self, batch: list[dict]) -> None:
+        """Process a batch of save tasks, sending them in a single gRPC request."""
         if not batch:
             return
 
@@ -697,29 +643,25 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Send batch request if there are saves
         if saves_by_layer:
             saves_list = [
-                {
-                    'layer_name': layer_name,
-                    'block_ids': list(data['block_ids']),
-                    'block_hashes': list(data['block_hashes']),
-                }
+                (layer_name, list(data['block_ids']), list(data['block_hashes']))
                 for layer_name, data in saves_by_layer.items()
             ]
 
-            payload = {
-                'instance_id': self._instance_id,
-                'saves': saves_list,
-            }
-            if self._tp_rank is not None:
-                payload['tp_rank'] = self._tp_rank
-            if self._device_id is not None:
-                payload['device_id'] = self._device_id
+            # Call gRPC save method
+            ok, message = self._engine_client.save(
+                self._instance_id,
+                self._tp_rank,
+                self._device_id,
+                saves_list,
+            )
 
-            self._zmq_send_recv(socket, 'SAVE', payload)
+            if not ok:
+                raise RuntimeError(f"Save batch failed: {message}")
 
             logger.debug(
                 "[PegaKVConnector] Batch saved %d layers, %d total blocks",
                 len(saves_list),
-                sum(len(s['block_ids']) for s in saves_list),
+                sum(len(s[1]) for s in saves_list),
             )
 
         # Update completion tracking for all requests in batch
@@ -957,12 +899,19 @@ class PegaKVConnector(KVConnectorBase_V1):
         load_state = PyLoadState()
         shm_name = load_state.shm_name()
 
-        self._send_engine_request('LOAD', {
-            'load_state_shm': shm_name,
-            'layer_names': target_layers,
-            'block_ids': all_block_ids,
-            'block_hashes': all_block_hashes,
-        })
+        # Call gRPC load method
+        ok, message = self._engine_client.load(
+            self._instance_id,
+            self._tp_rank,
+            self._device_id,
+            shm_name,
+            target_layers,
+            all_block_ids,
+            all_block_hashes,
+        )
+
+        if not ok:
+            raise RuntimeError(f"Load request failed: {message}")
 
         num_layers = len(target_layers)
         num_blocks = len(all_block_ids)
@@ -1368,8 +1317,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         if not block_hashes:
             return 0
 
-        response = self._send_engine_request('QUERY', {'block_hashes': block_hashes})
-        return response.get('hit_blocks', 0)
+        ok, message, hit_blocks = self._engine_client.query(block_hashes)
+        if not ok:
+            raise RuntimeError(f"Query failed: {message}")
+        return hit_blocks
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """
@@ -1417,17 +1368,23 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             assert bytes_per_block != 0, f"Invalid bytes_per_block for {layer_name}: stride={stride}"
 
-            self._send_engine_request('REGISTER_CONTEXT', {
-                'layer_name': layer_name,
-                'wrapper_bytes': wrapper_bytes,
-                'num_blocks': num_blocks,
-                'bytes_per_block': bytes_per_block,
-                'kv_stride_bytes': kv_stride_bytes,
-                'segments': segments,
-                'tp_size': self._tp_size,
-                'num_layers': self._num_layers,
-                'device_id': self._device_id,
-            })
+            # Call gRPC register_context method
+            ok, message = self._engine_client.register_context(
+                self._instance_id,
+                self._tp_rank,
+                self._tp_size,
+                self._device_id,
+                self._num_layers,
+                layer_name,
+                wrapper_bytes,
+                num_blocks,
+                bytes_per_block,
+                kv_stride_bytes,
+                segments,
+            )
+
+            if not ok:
+                raise RuntimeError(f"Register context failed for {layer_name}: {message}")
 
         logger.info(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
@@ -1444,7 +1401,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
 
         if self._tp_rank == 0:
-            self._send_engine_request('UNREGISTER_CONTEXT', {})
+            ok, message = self._engine_client.unregister_context(self._instance_id)
+            if not ok:
+                logger.warning(f"[PegaKVConnector] Unregister context failed: {message}")
 
         self._registered_layers.clear()
 
@@ -1534,14 +1493,6 @@ class PegaKVConnector(KVConnectorBase_V1):
         # Stop save worker
         self._save_queue.put(None)
         self._save_thread.join()
-
-        if self._engine_socket is not None:
-            self._engine_socket.close(0)
-            self._engine_socket = None
-
-        if self._engine_context is not None:
-            self._engine_context.term()
-            self._engine_context = None
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

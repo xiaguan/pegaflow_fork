@@ -70,7 +70,7 @@ def main():
     # Initialize vLLM with GPT-2
     print("\n[1/4] Loading model...")
     llm = LLM(
-        model="gpt2",
+        model="/home/sjy/.cache/modelscope/hub/models/Qwen/Qwen3-8B",
         trust_remote_code=True,
         enforce_eager=True,
         tensor_parallel_size=1,

@@ -1,12 +1,43 @@
-use std::sync::{Arc, Once};
-
+use engine_server::proto::engine::{
+    engine_client::EngineClient, HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest,
+    ResponseStatus, SaveLayer, SaveRequest, ShutdownRequest, UnregisterRequest,
+};
 use pega_core::{LoadState, PegaEngine as CoreEngine};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use std::{
+    future::Future,
+    sync::{Arc, Once, OnceLock},
+};
+use tokio::runtime::Runtime;
+use tonic::{
+    transport::{Channel, Error as TransportError},
+    Status as GrpcStatus,
+};
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
 
 static INIT_TRACING: Once = Once::new();
+static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+/// Get or create the global Tokio runtime (shared across all RPC calls)
+fn get_runtime() -> PyResult<&'static Runtime> {
+    // First check if already initialized (fast path)
+    if let Some(rt) = TOKIO_RUNTIME.get() {
+        return Ok(rt);
+    }
+
+    // Try to initialize - only one thread will succeed
+    let rt = Runtime::new().map_err(runtime_creation_error)?;
+
+    // Try to set it; if another thread beat us, that's fine - use theirs
+    let _ = TOKIO_RUNTIME.set(rt);
+
+    // Return whatever is now in the cell
+    TOKIO_RUNTIME
+        .get()
+        .ok_or_else(|| PyRuntimeError::new_err("failed to initialize Tokio runtime"))
+}
 
 fn init_tracing() {
     INIT_TRACING.call_once(|| {
@@ -25,10 +56,67 @@ fn init_tracing() {
     });
 }
 
+fn runtime_creation_error(err: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(format!("failed to create Tokio runtime: {err}"))
+}
+
+fn transport_connect_error(endpoint: &str, err: TransportError) -> PyErr {
+    PyRuntimeError::new_err(format!(
+        "failed to connect to engine server at {endpoint}: {err}"
+    ))
+}
+
+fn rpc_status_error(method: &str, err: GrpcStatus) -> PyErr {
+    PyRuntimeError::new_err(format!("{method} RPC failed: {err}"))
+}
+
+fn expect_status(method: &str, status: Option<ResponseStatus>) -> PyResult<ResponseStatus> {
+    status.ok_or_else(|| PyRuntimeError::new_err(format!("{method} response missing status")))
+}
+
+fn status_tuple(method: &str, status: Option<ResponseStatus>) -> PyResult<(bool, String)> {
+    let status = expect_status(method, status)?;
+    Ok((status.ok, status.message))
+}
+
+fn u64_to_usize(value: u64, field: &str) -> PyResult<usize> {
+    usize::try_from(value)
+        .map_err(|_| PyRuntimeError::new_err(format!("{field}={value} exceeds usize range")))
+}
+
 /// Python wrapper for PegaEngine
 #[pyclass]
 struct PegaEngine {
     engine: CoreEngine,
+}
+
+#[pyclass]
+struct EngineRpcClient {
+    endpoint: String,
+    channel: Channel,
+}
+
+impl EngineRpcClient {
+    /// Execute an RPC call with shared boilerplate:
+    /// - get global runtime
+    /// - clone channel
+    /// - create client
+    /// - block_on the async closure
+    fn call<F, Fut, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        F: FnOnce(EngineClient<Channel>) -> Fut + Send,
+        Fut: Future<Output = Result<T, GrpcStatus>> + Send,
+        T: Send,
+    {
+        let channel = self.channel.clone();
+        py.allow_threads(move || {
+            let rt = get_runtime()?;
+            rt.block_on(async move {
+                let client = EngineClient::new(channel);
+                f(client).await.map_err(|e| rpc_status_error("rpc", e))
+            })
+        })
+    }
 }
 
 #[pymethods]
@@ -231,6 +319,215 @@ impl PegaEngine {
     }
 }
 
+#[pymethods]
+impl EngineRpcClient {
+    #[new]
+    #[pyo3(signature = (endpoint = None))]
+    fn new(endpoint: Option<String>) -> PyResult<Self> {
+        let endpoint = endpoint.unwrap_or_else(|| "http://127.0.0.1:50055".to_string());
+        let rt = get_runtime()?;
+        let channel = rt
+            .block_on(Channel::from_shared(endpoint.clone()).unwrap().connect())
+            .map_err(|err| transport_connect_error(&endpoint, err))?;
+        Ok(Self { endpoint, channel })
+    }
+
+    /// Return the configured endpoint.
+    fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    /// Check if the engine server is healthy.
+    ///
+    /// Returns: (ok: bool, message: str)
+    fn health(&self, py: Python<'_>) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c.health(HealthRequest {}).await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("health", r.status))
+    }
+
+    /// Register a context layer for KV cache operations.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     tp_rank: Tensor parallel rank
+    ///     tp_size: Total tensor parallel size
+    ///     device_id: CUDA device ID
+    ///     num_layers: Number of model layers
+    ///     layer_name: Name of this layer
+    ///     wrapper_bytes: Serialized CUDA tensor wrapper
+    ///     num_blocks: Number of KV blocks
+    ///     bytes_per_block: Size of each block in bytes
+    ///     kv_stride_bytes: Stride between K and V
+    ///     segments: Number of segments per block
+    ///
+    /// Returns: (ok: bool, message: str)
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (instance_id, tp_rank, tp_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
+    fn register_context(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        tp_rank: u32,
+        tp_size: u32,
+        device_id: i32,
+        num_layers: u32,
+        layer_name: String,
+        wrapper_bytes: Vec<u8>,
+        num_blocks: u64,
+        bytes_per_block: u64,
+        kv_stride_bytes: u64,
+        segments: u32,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c
+                .register_context(RegisterContextRequest {
+                    instance_id,
+                    tp_rank,
+                    tp_size,
+                    device_id,
+                    num_layers,
+                    layer_name,
+                    wrapper_bytes,
+                    num_blocks,
+                    bytes_per_block,
+                    kv_stride_bytes,
+                    segments,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("register_context", r.status))
+    }
+
+    /// Save KV blocks to the engine.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     tp_rank: Tensor parallel rank
+    ///     device_id: CUDA device ID
+    ///     saves: List of (layer_name, block_ids, block_hashes) tuples
+    ///
+    /// Returns: (ok: bool, message: str)
+    fn save(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        tp_rank: u32,
+        device_id: i32,
+        saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
+    ) -> PyResult<(bool, String)> {
+        let saves = saves
+            .into_iter()
+            .map(|(layer_name, block_ids, block_hashes)| SaveLayer {
+                layer_name,
+                block_ids,
+                block_hashes,
+            })
+            .collect();
+        self.call(py, |mut c| async move {
+            let resp = c
+                .save(SaveRequest {
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    saves,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("save", r.status))
+    }
+
+    /// Load KV blocks from the engine.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID
+    ///     tp_rank: Tensor parallel rank
+    ///     device_id: CUDA device ID
+    ///     load_state_shm: Shared memory name for load state sync
+    ///     layer_names: List of layer names to load
+    ///     block_ids: GPU block IDs to load into
+    ///     block_hashes: Content hashes for blocks
+    ///
+    /// Returns: (ok: bool, message: str)
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        tp_rank: u32,
+        device_id: i32,
+        load_state_shm: String,
+        layer_names: Vec<String>,
+        block_ids: Vec<i32>,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c
+                .load(LoadRequest {
+                    instance_id,
+                    tp_rank,
+                    device_id,
+                    load_state_shm,
+                    layer_names,
+                    block_ids,
+                    block_hashes,
+                })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("load", r.status))
+    }
+
+    /// Query prefix cache hits.
+    ///
+    /// Args:
+    ///     block_hashes: List of block hashes to check
+    ///
+    /// Returns: (ok: bool, message: str, hit_blocks: int)
+    fn query(&self, py: Python<'_>, block_hashes: Vec<Vec<u8>>) -> PyResult<(bool, String, usize)> {
+        self.call(py, |mut c| async move {
+            let resp = c.query(QueryRequest { block_hashes }).await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| {
+            let (ok, msg) = status_tuple("query", r.status)?;
+            let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
+            Ok((ok, msg, hit))
+        })
+    }
+
+    /// Unregister a context/instance.
+    ///
+    /// Args:
+    ///     instance_id: Model instance ID to unregister
+    ///
+    /// Returns: (ok: bool, message: str)
+    fn unregister_context(&self, py: Python<'_>, instance_id: String) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c
+                .unregister_context(UnregisterRequest { instance_id })
+                .await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("unregister_context", r.status))
+    }
+
+    /// Shutdown the engine server.
+    ///
+    /// Returns: (ok: bool, message: str)
+    fn shutdown(&self, py: Python<'_>) -> PyResult<(bool, String)> {
+        self.call(py, |mut c| async move {
+            let resp = c.shutdown(ShutdownRequest {}).await?;
+            Ok(resp.into_inner())
+        })
+        .and_then(|r| status_tuple("shutdown", r.status))
+    }
+}
+
 /// Python wrapper for LoadState (batch-level sync for async KV cache loading)
 ///
 /// Created by connector worker before starting a load batch.
@@ -300,6 +597,7 @@ impl PyLoadState {
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
     m.add_class::<PegaEngine>()?;
+    m.add_class::<EngineRpcClient>()?;
     m.add_class::<PyLoadState>()?;
     Ok(())
 }

@@ -8,6 +8,9 @@ name = "pegaflow"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3.workspace = true
+pyo3 = { workspace = true, features = ["extension-module"] }
 pega-core.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+engine-server = { path = "../engine-server" }

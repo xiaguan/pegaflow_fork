@@ -1,0 +1,21 @@
+[package]
+name = "engine-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pega-core.workspace = true
+prost.workspace = true
+pyo3 = { workspace = true, features = ["auto-initialize"] }
+cudarc.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+pyo3-build-config.workspace = true
