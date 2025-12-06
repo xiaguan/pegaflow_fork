@@ -35,6 +35,9 @@ struct RouterState {
     decode_urls: Arc<Vec<String>>,
     p_index: Arc<AtomicUsize>,
     d_index: Arc<AtomicUsize>,
+    // Track in-flight requests per node
+    p_inflight: Arc<Vec<AtomicUsize>>,
+    d_inflight: Arc<Vec<AtomicUsize>>,
 }
 
 impl RouterState {
@@ -57,6 +60,15 @@ impl RouterState {
             })
             .collect();
 
+        let p_inflight: Vec<AtomicUsize> = prefill_endpoints
+            .iter()
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+        let d_inflight: Vec<AtomicUsize> = decode_endpoints
+            .iter()
+            .map(|_| AtomicUsize::new(0))
+            .collect();
+
         Self {
             prefill_clients: Arc::new(prefill_clients),
             decode_clients: Arc::new(decode_clients),
@@ -64,25 +76,45 @@ impl RouterState {
             decode_urls: Arc::new(decode_endpoints),
             p_index: Arc::new(AtomicUsize::new(0)),
             d_index: Arc::new(AtomicUsize::new(0)),
+            p_inflight: Arc::new(p_inflight),
+            d_inflight: Arc::new(d_inflight),
         }
     }
 
-    fn get_next_p(&self) -> (Client, String) {
+    fn get_next_p(&self) -> (Client, String, usize) {
         let idx = self.p_index.fetch_add(1, Ordering::Relaxed);
         let idx = idx % self.prefill_clients.len();
+        self.p_inflight[idx].fetch_add(1, Ordering::Relaxed);
         (
             self.prefill_clients[idx].clone(),
             self.prefill_urls[idx].clone(),
+            idx,
         )
     }
 
-    fn get_next_d(&self) -> (Client, String) {
+    fn get_next_d(&self) -> (Client, String, usize) {
         let idx = self.d_index.fetch_add(1, Ordering::Relaxed);
         let idx = idx % self.decode_clients.len();
+        self.d_inflight[idx].fetch_add(1, Ordering::Relaxed);
         (
             self.decode_clients[idx].clone(),
             self.decode_urls[idx].clone(),
+            idx,
         )
+    }
+
+    fn finish_p(&self, idx: usize) {
+        self.p_inflight[idx].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn finish_d(&self, idx: usize) {
+        self.d_inflight[idx].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn get_inflight_summary(&self) -> String {
+        let p_counts: Vec<usize> = self.p_inflight.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let d_counts: Vec<usize> = self.d_inflight.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        format!("P={:?} D={:?}", p_counts, d_counts)
     }
 }
 
@@ -101,7 +133,7 @@ async fn handle_completion(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    info!("request arrived: req={}", req_id);
+    info!("request arrived: req={} inflight=[{}]", req_id, state.get_inflight_summary());
 
     // Save original values to restore for D request
     let org_max_tokens = body.get("max_tokens").cloned();
@@ -118,7 +150,9 @@ async fn handle_completion(
     p_body["request_id"] = json!(req_id.clone());
 
     // Remove stream_options since stream=false
-    p_body.as_object_mut().map(|obj| obj.remove("stream_options"));
+    p_body
+        .as_object_mut()
+        .map(|obj| obj.remove("stream_options"));
 
     // Ensure min_tokens <= max_tokens to avoid 400 from P node
     if let Some(min_tokens) = p_body.get("min_tokens").and_then(|v| v.as_i64()) {
@@ -127,7 +161,7 @@ async fn handle_completion(
         p_body["min_tokens"] = json!(0);
     }
 
-    let (p_client, p_url) = state.get_next_p();
+    let (p_client, p_url, p_idx) = state.get_next_p();
     let p_url = format!("{}{}", p_url, api_path);
 
     // Send to P node
@@ -140,6 +174,7 @@ async fn handle_completion(
     {
         Ok(resp) => resp,
         Err(e) => {
+            state.finish_p(p_idx);
             error!("P request failed: req={} error={}", req_id, e);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -153,6 +188,7 @@ async fn handle_completion(
     let p_result: Value = match p_response.json().await {
         Ok(v) => v,
         Err(e) => {
+            state.finish_p(p_idx);
             error!("P response parse failed: req={} error={}", req_id, e);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -161,6 +197,9 @@ async fn handle_completion(
                 .into_response();
         }
     };
+
+    // P node finished
+    state.finish_p(p_idx);
 
     if !p_status.is_success() {
         error!(
@@ -171,7 +210,7 @@ async fn handle_completion(
     }
 
     let prefill_latency = arrive_time.elapsed().as_millis();
-    info!("prefill done: req={} latency={}ms", req_id, prefill_latency);
+    info!("prefill done: req={} P[{}] latency={}ms inflight=[{}]", req_id, p_idx, prefill_latency, state.get_inflight_summary());
 
     // Prepare D request (restore original settings)
     let mut d_body = body;
@@ -184,7 +223,7 @@ async fn handle_completion(
         d_body["stream_options"] = stream_opts;
     }
 
-    let (d_client, d_url) = state.get_next_d();
+    let (d_client, d_url, d_idx) = state.get_next_d();
     let d_url = format!("{}{}", d_url, api_path);
 
     if org_stream {
@@ -198,6 +237,7 @@ async fn handle_completion(
         {
             Ok(resp) => resp,
             Err(e) => {
+                state.finish_d(d_idx);
                 error!("D request failed: req={} error={}", req_id, e);
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -208,6 +248,7 @@ async fn handle_completion(
         };
 
         let stream = d_response.bytes_stream();
+        let state_clone = state.clone();
         let stream = tokio_stream::wrappers::ReceiverStream::new({
             let (tx, rx) = tokio::sync::mpsc::channel(100);
             let req_id = req_id.clone();
@@ -226,8 +267,10 @@ async fn handle_completion(
                         }
                     }
                 }
+                // D node finished (stream ended)
+                state_clone.finish_d(d_idx);
                 let total = arrive_time.elapsed().as_millis();
-                info!("done (stream): req={} total={}ms", req_id, total);
+                info!("done (stream): req={} D[{}] total={}ms inflight=[{}]", req_id, d_idx, total, state_clone.get_inflight_summary());
             });
             rx
         });
@@ -248,6 +291,7 @@ async fn handle_completion(
         {
             Ok(resp) => resp,
             Err(e) => {
+                state.finish_d(d_idx);
                 error!("D request failed: req={} error={}", req_id, e);
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -261,6 +305,7 @@ async fn handle_completion(
         let d_result: Value = match d_response.json().await {
             Ok(v) => v,
             Err(e) => {
+                state.finish_d(d_idx);
                 error!("D response parse failed: req={} error={}", req_id, e);
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -270,8 +315,10 @@ async fn handle_completion(
             }
         };
 
+        // D node finished
+        state.finish_d(d_idx);
         let total = arrive_time.elapsed().as_millis();
-        info!("done: req={} total={}ms", req_id, total);
+        info!("done: req={} D[{}] total={}ms inflight=[{}]", req_id, d_idx, total, state.get_inflight_summary());
 
         (d_status, Json(d_result)).into_response()
     }
