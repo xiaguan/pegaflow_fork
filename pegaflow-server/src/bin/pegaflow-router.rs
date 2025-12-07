@@ -112,8 +112,16 @@ impl RouterState {
     }
 
     fn get_inflight_summary(&self) -> String {
-        let p_counts: Vec<usize> = self.p_inflight.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        let d_counts: Vec<usize> = self.d_inflight.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let p_counts: Vec<usize> = self
+            .p_inflight
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let d_counts: Vec<usize> = self
+            .d_inflight
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
         format!("P={:?} D={:?}", p_counts, d_counts)
     }
 }
@@ -133,7 +141,11 @@ async fn handle_completion(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    info!("request arrived: req={} inflight=[{}]", req_id, state.get_inflight_summary());
+    info!(
+        "request arrived: req={} inflight=[{}]",
+        req_id,
+        state.get_inflight_summary()
+    );
 
     // Save original values to restore for D request
     let org_max_tokens = body.get("max_tokens").cloned();
@@ -210,7 +222,13 @@ async fn handle_completion(
     }
 
     let prefill_latency = arrive_time.elapsed().as_millis();
-    info!("prefill done: req={} P[{}] latency={}ms inflight=[{}]", req_id, p_idx, prefill_latency, state.get_inflight_summary());
+    info!(
+        "prefill done: req={} P[{}] latency={}ms inflight=[{}]",
+        req_id,
+        p_idx,
+        prefill_latency,
+        state.get_inflight_summary()
+    );
 
     // Prepare D request (restore original settings)
     let mut d_body = body;
@@ -270,7 +288,13 @@ async fn handle_completion(
                 // D node finished (stream ended)
                 state_clone.finish_d(d_idx);
                 let total = arrive_time.elapsed().as_millis();
-                info!("done (stream): req={} D[{}] total={}ms inflight=[{}]", req_id, d_idx, total, state_clone.get_inflight_summary());
+                info!(
+                    "done (stream): req={} D[{}] total={}ms inflight=[{}]",
+                    req_id,
+                    d_idx,
+                    total,
+                    state_clone.get_inflight_summary()
+                );
             });
             rx
         });
@@ -318,7 +342,13 @@ async fn handle_completion(
         // D node finished
         state.finish_d(d_idx);
         let total = arrive_time.elapsed().as_millis();
-        info!("done: req={} D[{}] total={}ms inflight=[{}]", req_id, d_idx, total, state.get_inflight_summary());
+        info!(
+            "done: req={} D[{}] total={}ms inflight=[{}]",
+            req_id,
+            d_idx,
+            total,
+            state.get_inflight_summary()
+        );
 
         (d_status, Json(d_result)).into_response()
     }

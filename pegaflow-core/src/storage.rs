@@ -24,6 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
+use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
 const RECLAIM_BATCH_OBJECTS: usize = 256;
@@ -322,6 +323,7 @@ impl StorageEngine {
                     used as f64 / 1e6,
                     total as f64 / 1e6
                 );
+                core_metrics().pool_alloc_failures.add(1, &[]);
                 return None;
             }
         }
@@ -343,6 +345,11 @@ impl StorageEngine {
         }
 
         info!("Reclaimed {} blocks from cache", freed_entries);
+        if freed_entries > 0 {
+            core_metrics()
+                .cache_block_evictions
+                .add(freed_entries as u64, &[]);
+        }
 
         freed_entries
     }
@@ -378,6 +385,8 @@ impl StorageEngine {
         let entry = cache.get(&key).cloned().unwrap_or_else(|| {
             let new_blocks = Arc::new(Block::new(total_slots));
             cache.insert(key.clone(), Arc::clone(&new_blocks));
+            // Record new block insertion into cache
+            core_metrics().cache_block_insertions.add(1, &[]);
             new_blocks
         });
         entry.insert_slot(slot_id, block, total_slots)

@@ -14,6 +14,7 @@ rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
 crossbeam.workspace = true
+opentelemetry.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

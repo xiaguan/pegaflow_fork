@@ -7,6 +7,7 @@ use std::{
 use tracing::info;
 
 use crate::allocator::{Allocation, ScaledOffsetAllocator};
+use crate::metrics::core_metrics;
 
 /// RAII guard for a pinned memory allocation.
 /// Automatically frees the allocation when dropped.
@@ -87,12 +88,19 @@ impl PinnedMemoryPool {
             Err(err) => panic!("Pinned memory allocation error: {}", err),
         };
 
+        let metrics = core_metrics();
+
         let offset: usize = allocation
             .offset_bytes
             .try_into()
             .expect("allocation offset exceeds usize");
         let ptr = unsafe { self.base_ptr.as_ptr().add(offset) };
         let ptr = NonNull::new(ptr).expect("PinnedMemoryPool returned null pointer");
+
+        let size_bytes = allocation.size_bytes.get();
+        if let Ok(size_i64) = i64::try_from(size_bytes) {
+            metrics.pool_used_bytes.add(size_i64, &[]);
+        }
 
         Some(PinnedAllocation {
             allocation,
@@ -107,6 +115,12 @@ impl PinnedMemoryPool {
     pub(crate) fn free_internal(&self, allocation: &Allocation) {
         let mut allocator = self.allocator.lock().unwrap();
         allocator.free(allocation);
+
+        let metrics = core_metrics();
+        let size_bytes = allocation.size_bytes.get();
+        if let Ok(size_i64) = i64::try_from(size_bytes) {
+            metrics.pool_used_bytes.add(-size_i64, &[]);
+        }
     }
 
     /// Get (used_bytes, total_bytes) for the pool.

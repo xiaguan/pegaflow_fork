@@ -4,9 +4,7 @@ pub fn parse_memory_size(s: &str) -> Result<usize, String> {
     let s = s.trim();
 
     // Find the boundary between number and unit
-    let boundary = s
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(s.len());
+    let boundary = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
 
     let (num_str, unit_str) = s.split_at(boundary);
 
@@ -33,9 +31,8 @@ pub fn parse_memory_size(s: &str) -> Result<usize, String> {
 
     let bytes = (value * multiplier as f64) as u64;
 
-    usize::try_from(bytes).map_err(|_| {
-        format!("Memory size {} bytes exceeds maximum supported size", bytes)
-    })
+    usize::try_from(bytes)
+        .map_err(|_| format!("Memory size {} bytes exceeds maximum supported size", bytes))
 }
 
 #[cfg(test)]
@@ -46,7 +43,10 @@ mod tests {
     fn test_parse_memory_size_basic() {
         assert_eq!(parse_memory_size("1024").unwrap(), 1024);
         assert_eq!(parse_memory_size("1gb").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1.5gb").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as usize);
+        assert_eq!(
+            parse_memory_size("1.5gb").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as usize
+        );
     }
 
     #[test]

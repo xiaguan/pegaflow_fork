@@ -2,6 +2,9 @@ mod utils;
 
 use clap::Parser;
 use cudarc::driver::result as cuda_driver;
+use opentelemetry::global;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use parking_lot::Mutex;
 use pegaflow_core::PegaEngine;
 use pegaflow_server::proto::engine::engine_server::EngineServer;
@@ -10,6 +13,7 @@ use pyo3::{types::PyAnyMethods, PyErr, Python};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -35,6 +39,14 @@ struct Cli {
     /// Examples: "10gb", "500mb", "1tb"
     #[arg(long, default_value = "30gb", value_parser = parse_memory_size)]
     pool_size: usize,
+
+    /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
+    #[arg(long, default_value = "http://127.0.0.1:4321")]
+    metrics_otel_endpoint: Option<String>,
+
+    /// Period (seconds) for exporting OTLP metrics (only used when endpoint is set).
+    #[arg(long, default_value_t = 5)]
+    metrics_period_secs: u64,
 }
 
 fn init_tracing() {
@@ -82,6 +94,32 @@ fn init_python_cuda(device_id: i32) -> Result<(), std::io::Error> {
     })
 }
 
+fn init_metrics(
+    endpoint: Option<String>,
+    period_secs: u64,
+) -> Result<Option<SdkMeterProvider>, Box<dyn Error>> {
+    let Some(endpoint) = endpoint else {
+        info!("OTLP metrics disabled (no endpoint configured)");
+        return Ok(None);
+    };
+
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_secs(period_secs))
+        .build();
+
+    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+
+    global::set_meter_provider(meter_provider.clone());
+    info!("OTLP metrics exporter enabled (period={}s)", period_secs);
+
+    Ok(Some(meter_provider))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
     let cli = Cli::parse();
@@ -115,7 +153,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()?;
 
+    let metrics_endpoint = cli.metrics_otel_endpoint.clone();
+    let metrics_period = cli.metrics_period_secs;
+
     runtime.block_on(async move {
+        // Initialize OTEL metrics (requires Tokio runtime for gRPC)
+        let meter_provider = init_metrics(metrics_endpoint, metrics_period)?;
+
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);
             async move {
@@ -142,6 +186,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         info!("Server stopped");
+
+        // Flush metrics before exit
+        if let Some(provider) = meter_provider {
+            if let Err(err) = provider.shutdown() {
+                error!("Failed to shutdown metrics provider: {err}");
+            }
+        }
+
         Ok(())
     })
 }

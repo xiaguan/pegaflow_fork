@@ -498,9 +498,19 @@ impl EngineRpcClient {
     ///     block_hashes: List of block hashes to check
     ///
     /// Returns: (ok: bool, message: str, hit_blocks: int)
-    fn query(&self, py: Python<'_>, instance_id: String, block_hashes: Vec<Vec<u8>>) -> PyResult<(bool, String, usize)> {
+    fn query(
+        &self,
+        py: Python<'_>,
+        instance_id: String,
+        block_hashes: Vec<Vec<u8>>,
+    ) -> PyResult<(bool, String, usize)> {
         self.call(py, |mut c| async move {
-            let resp = c.query(QueryRequest { instance_id, block_hashes }).await?;
+            let resp = c
+                .query(QueryRequest {
+                    instance_id,
+                    block_hashes,
+                })
+                .await?;
             Ok(resp.into_inner())
         })
         .and_then(|r| {

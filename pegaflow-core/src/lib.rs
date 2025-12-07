@@ -1,4 +1,5 @@
 pub mod allocator;
+mod metrics;
 pub mod pinned_pool;
 mod storage;
 pub mod sync_state;
@@ -38,6 +39,7 @@ use std::{
 };
 use tracing::{debug, info, instrument};
 
+use crate::metrics::core_metrics;
 use crate::storage::{LayerBlock, StorageEngine};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
@@ -468,6 +470,9 @@ impl PegaEngine {
             )));
         }
 
+        let metrics = core_metrics();
+        let timer = std::time::Instant::now();
+
         let instance = self.get_instance(instance_id)?;
         let worker = instance
             .get_gpu(device_id)
@@ -631,6 +636,15 @@ impl PegaEngine {
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         }
+
+        let elapsed = timer.elapsed().as_secs_f64();
+        let total_bytes = (block_size as u64)
+            .checked_mul(num_blocks as u64)
+            .unwrap_or(0);
+        if num_blocks > 0 {
+            metrics.save_bytes.add(total_bytes, &[]);
+            metrics.save_duration_ms.record(elapsed * 1000.0, &[]);
+        }
         Ok(())
     }
 
@@ -652,18 +666,32 @@ impl PegaEngine {
         fields(instance=%instance_id, requested = %block_hashes.len()),
         ret
     )]
-    pub fn count_prefix_hit_blocks(&self, instance_id: &str, block_hashes: &[Vec<u8>]) -> Result<usize, EngineError> {
+    pub fn count_prefix_hit_blocks(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<usize, EngineError> {
         let instance = self.get_instance(instance_id)?;
         let namespace = &instance.namespace;
 
         let mut hit_count = 0;
+        let metrics = crate::metrics::core_metrics();
 
         for block_hash in block_hashes.iter() {
             // Storage engine handles "completion" atomically across all layers and TP ranks
             if !self.storage.block_is_complete(namespace, block_hash) {
+                // Block not complete: cache miss for remaining blocks
+                metrics
+                    .cache_block_misses
+                    .add((block_hashes.len() - hit_count) as u64, &[]);
                 break;
             }
             hit_count += 1;
+        }
+
+        // Record cache hits
+        if hit_count > 0 {
+            metrics.cache_block_hits.add(hit_count as u64, &[]);
         }
 
         debug!(
@@ -716,6 +744,7 @@ impl PegaEngine {
         // Clone data for thread
         let layer_names: Vec<String> = layer_names.iter().map(|s| s.to_string()).collect();
         let block_ids = block_ids.to_vec();
+        let metrics = core_metrics();
 
         // Spawn background thread to do all work
         std::thread::spawn(move || {
@@ -812,6 +841,7 @@ impl PegaEngine {
 
             if let Err(e) = final_event.synchronize() {
                 info!("Failed to sync final event: {:?}", e);
+                metrics.load_failures.add(1, &[]);
                 load_state.set_error();
                 return;
             }
@@ -822,6 +852,13 @@ impl PegaEngine {
             } else {
                 0.0
             };
+
+            if total_blocks > 0 {
+                metrics.load_bytes.add(total_bytes as u64, &[]);
+                metrics
+                    .load_duration_ms
+                    .record(elapsed.as_secs_f64() * 1000.0, &[]);
+            }
 
             info!(
                 "Transfers complete: {} blocks, {:.2} MB in {:?} ({:.2} GB/s)",
