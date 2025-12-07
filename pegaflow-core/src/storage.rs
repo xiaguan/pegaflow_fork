@@ -34,6 +34,28 @@ const RECLAIM_BATCH_OBJECTS: usize = 256;
 // and this count is immutable for the lifetime of the Instance.
 // NOTE: Storage is generic and operates on flat indices (slots).
 
+/// Key for identifying blocks in storage, including namespace for model isolation.
+///
+/// NOTE: Using String for namespace is simple but adds ~20-50 bytes overhead per key.
+/// Future optimization: intern namespaces to u32 IDs (saves memory, faster comparison).
+///
+/// TODO: Optimize BlockKey to avoid deep copy on every lookup
+/// Current issue: BlockKey::new creates deep copies of namespace (String) and hash (Vec<u8>)
+/// on every lookup in hot paths (slot_has_block, block_is_complete).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BlockKey {
+    /// Namespace for model isolation (e.g., model name, or empty string for shared storage)
+    pub namespace: String,
+    /// Block content hash
+    pub hash: Vec<u8>,
+}
+
+impl BlockKey {
+    pub fn new(namespace: String, hash: Vec<u8>) -> Self {
+        Self { namespace, hash }
+    }
+}
+
 pub type BlockHash = Vec<u8>;
 type LayerBlockSlots = Vec<Option<Arc<LayerBlock>>>;
 
@@ -268,7 +290,7 @@ unsafe impl Send for LayerBlock {}
 unsafe impl Sync for LayerBlock {}
 
 pub struct StorageEngine {
-    kv_storage: Mutex<LruCache<BlockHash, Arc<Block>>>,
+    kv_storage: Mutex<LruCache<BlockKey, Arc<Block>>>,
     pinned_pool: Arc<PinnedMemoryPool>,
 }
 
@@ -325,44 +347,53 @@ impl StorageEngine {
         freed_entries
     }
 
-    pub fn slot_has_block(&self, block_hash: &[u8], slot_id: usize) -> bool {
+    pub fn slot_has_block(&self, namespace: &str, block_hash: &[u8], slot_id: usize) -> bool {
+        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
         let mut cache = self.kv_storage.lock().unwrap();
         cache
-            .get(block_hash)
+            .get(&key)
             .map(|blocks| blocks.slot_has_block(slot_id))
             .unwrap_or(false)
     }
 
-    pub fn block_is_complete(&self, block_hash: &[u8]) -> bool {
+    pub fn block_is_complete(&self, namespace: &str, block_hash: &[u8]) -> bool {
+        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
         let mut cache = self.kv_storage.lock().unwrap();
         cache
-            .get(block_hash)
+            .get(&key)
             .map(|blocks| blocks.is_complete())
             .unwrap_or(false)
     }
 
     pub fn insert_block(
         &self,
+        namespace: &str,
         block_hash: BlockHash,
         slot_id: usize,
         block: Arc<LayerBlock>,
         total_slots: usize,
     ) -> Result<(), BlockInsertError> {
+        let key = BlockKey::new(namespace.to_string(), block_hash.clone());
         let mut cache = self.kv_storage.lock().unwrap();
-        let entry = cache.get(&block_hash).cloned().unwrap_or_else(|| {
+        let entry = cache.get(&key).cloned().unwrap_or_else(|| {
             let new_blocks = Arc::new(Block::new(total_slots));
-            cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
+            cache.insert(key.clone(), Arc::clone(&new_blocks));
             new_blocks
         });
         entry.insert_slot(slot_id, block, total_slots)
     }
 
-    pub fn lookup_many(&self, block_hashes: &[Vec<u8>]) -> Result<Vec<Arc<Block>>, String> {
+    pub fn lookup_many(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<Vec<Arc<Block>>, String> {
         let mut cache = self.kv_storage.lock().unwrap();
         let mut result = Vec::with_capacity(block_hashes.len());
         for hash in block_hashes {
+            let key = BlockKey::new(namespace.to_string(), hash.clone());
             let shard_blocks = cache
-                .get(hash)
+                .get(&key)
                 .cloned()
                 .ok_or_else(|| "Missing KV block hash".to_string())?;
             result.push(shard_blocks);

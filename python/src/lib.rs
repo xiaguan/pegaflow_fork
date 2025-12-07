@@ -134,6 +134,7 @@ impl PegaEngine {
     ///
     /// Args:
     ///     instance_id: ID of the model instance
+    ///     namespace: Namespace for model isolation
     ///     device_id: CUDA device ID
     ///     layer_name: Name of the layer
     ///     data_ptr: GPU data pointer (as u64)
@@ -150,6 +151,7 @@ impl PegaEngine {
     fn register_context_layer(
         &mut self,
         instance_id: &str,
+        namespace: &str,
         device_id: i32,
         layer_name: String,
         data_ptr: u64,
@@ -165,6 +167,7 @@ impl PegaEngine {
         self.engine
             .register_context_layer(
                 instance_id,
+                namespace,
                 device_id,
                 layer_name,
                 data_ptr,
@@ -259,6 +262,7 @@ impl PegaEngine {
     /// CPU cache completion status directly (no GPU context required).
     ///
     /// Args:
+    ///     instance_id: ID of the model instance
     ///     block_hashes: List of block hashes to check (list of bytes)
     ///
     /// Returns:
@@ -266,10 +270,12 @@ impl PegaEngine {
     fn count_prefix_hit_blocks(
         &self,
         py: Python<'_>,
+        instance_id: &str,
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<usize> {
+        let instance_id_owned = instance_id.to_string();
         let engine = &self.engine;
-        py.allow_threads(move || engine.count_prefix_hit_blocks(&block_hashes))
+        py.allow_threads(move || engine.count_prefix_hit_blocks(&instance_id_owned, &block_hashes))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -352,6 +358,7 @@ impl EngineRpcClient {
     ///
     /// Args:
     ///     instance_id: Model instance ID
+    ///     namespace: Namespace for model isolation
     ///     tp_rank: Tensor parallel rank
     ///     tp_size: Total tensor parallel size
     ///     device_id: CUDA device ID
@@ -365,11 +372,12 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, tp_rank, tp_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
     fn register_context(
         &self,
         py: Python<'_>,
         instance_id: String,
+        namespace: String,
         tp_rank: u32,
         tp_size: u32,
         device_id: i32,
@@ -395,6 +403,7 @@ impl EngineRpcClient {
                     bytes_per_block,
                     kv_stride_bytes,
                     segments,
+                    namespace,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -485,12 +494,13 @@ impl EngineRpcClient {
     /// Query prefix cache hits.
     ///
     /// Args:
+    ///     instance_id: Model instance ID
     ///     block_hashes: List of block hashes to check
     ///
     /// Returns: (ok: bool, message: str, hit_blocks: int)
-    fn query(&self, py: Python<'_>, block_hashes: Vec<Vec<u8>>) -> PyResult<(bool, String, usize)> {
+    fn query(&self, py: Python<'_>, instance_id: String, block_hashes: Vec<Vec<u8>>) -> PyResult<(bool, String, usize)> {
         self.call(py, |mut c| async move {
-            let resp = c.query(QueryRequest { block_hashes }).await?;
+            let resp = c.query(QueryRequest { instance_id, block_hashes }).await?;
             Ok(resp.into_inner())
         })
         .and_then(|r| {

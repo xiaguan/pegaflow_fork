@@ -139,6 +139,8 @@ impl GpuContext {
 /// Global context for a Model Instance (across all device assignments)
 struct InstanceContext {
     _id: String,
+    /// Namespace for model isolation (fixed for the instance lifetime)
+    namespace: String,
     num_layers: usize,
     tp_size: usize,
     /// Maps layer name to layer ID (0..num_layers)
@@ -150,9 +152,10 @@ struct InstanceContext {
 }
 
 impl InstanceContext {
-    fn new(id: String, num_layers: usize, tp_size: usize) -> Self {
+    fn new(id: String, namespace: String, num_layers: usize, tp_size: usize) -> Self {
         Self {
             _id: id,
+            namespace,
             num_layers,
             tp_size,
             layer_name_to_id: Mutex::new(HashMap::new()),
@@ -266,6 +269,7 @@ impl PegaEngine {
     fn get_or_create_instance(
         &self,
         instance_id: &str,
+        namespace: &str,
         num_layers: usize,
         tp_size: usize,
     ) -> Result<Arc<InstanceContext>, EngineError> {
@@ -301,6 +305,7 @@ impl PegaEngine {
 
         let instance = Arc::new(InstanceContext::new(
             instance_id.to_string(),
+            namespace.to_string(),
             num_layers,
             tp_size,
         ));
@@ -325,6 +330,7 @@ impl PegaEngine {
     pub fn register_context_layer(
         &self,
         instance_id: &str,
+        namespace: &str,
         device_id: i32,
         layer_name: String,
         data_ptr: u64,
@@ -348,7 +354,7 @@ impl PegaEngine {
             ));
         }
 
-        let instance = self.get_or_create_instance(instance_id, num_layers, tp_size)?;
+        let instance = self.get_or_create_instance(instance_id, namespace, num_layers, tp_size)?;
         let worker = instance.ensure_gpu(device_id)?;
 
         // Register layer ID in global instance map
@@ -399,11 +405,15 @@ impl PegaEngine {
         device_id: i32,
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> Result<(), EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+
         for (layer_name, block_ids, block_hashes) in saves {
             self.save_kv_blocks_from_ipc_inner(
                 instance_id,
                 tp_rank,
                 device_id,
+                namespace,
                 &layer_name,
                 block_ids,
                 block_hashes,
@@ -426,10 +436,14 @@ impl PegaEngine {
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
     ) -> Result<(), EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+
         self.save_kv_blocks_from_ipc_inner(
             instance_id,
             tp_rank,
             device_id,
+            namespace,
             layer_name,
             block_ids,
             block_hashes,
@@ -441,6 +455,7 @@ impl PegaEngine {
         instance_id: &str,
         tp_rank: usize,
         device_id: i32,
+        namespace: &str,
         layer_name: &str,
         block_ids: Vec<i32>,
         block_hashes: Vec<Vec<u8>>,
@@ -485,7 +500,7 @@ impl PegaEngine {
             }
 
             // Check if this block_hash already has data for this slot
-            let needs_save = !self.storage.slot_has_block(block_hash, slot_id);
+            let needs_save = !self.storage.slot_has_block(namespace, block_hash, slot_id);
 
             if needs_save {
                 blocks_to_save.push((block_idx, block_hash.clone()));
@@ -580,7 +595,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(block_hash, slot_id, block, total_slots)
+                    .insert_block(namespace, block_hash, slot_id, block, total_slots)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         } else {
@@ -612,7 +627,7 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(block_hash, slot_id, block, total_slots)
+                    .insert_block(namespace, block_hash, slot_id, block, total_slots)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         }
@@ -626,6 +641,7 @@ impl PegaEngine {
     /// Uses the per-block completion status so schedulers only see fully saved blocks.
     ///
     /// Args:
+    ///   - instance_id: Model instance ID
     ///   - block_hashes: List of block hashes to check
     ///
     /// Returns:
@@ -633,15 +649,18 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_hashes),
-        fields(requested = %block_hashes.len()),
+        fields(instance=%instance_id, requested = %block_hashes.len()),
         ret
     )]
-    pub fn count_prefix_hit_blocks(&self, block_hashes: &[Vec<u8>]) -> Result<usize, EngineError> {
+    pub fn count_prefix_hit_blocks(&self, instance_id: &str, block_hashes: &[Vec<u8>]) -> Result<usize, EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+
         let mut hit_count = 0;
 
         for block_hash in block_hashes.iter() {
             // Storage engine handles "completion" atomically across all layers and TP ranks
-            if !self.storage.block_is_complete(block_hash) {
+            if !self.storage.block_is_complete(namespace, block_hash) {
                 break;
             }
             hit_count += 1;
@@ -682,6 +701,8 @@ impl PegaEngine {
         let load_state = LoadState::attach(load_state_shm)?;
 
         let instance = self.get_instance(instance_id)?;
+        let namespace = &instance.namespace;
+
         let worker = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
@@ -689,7 +710,7 @@ impl PegaEngine {
         // Lookup all block_hashes ONCE and cache the blocks
         let block_cache = self
             .storage
-            .lookup_many(block_hashes)
+            .lookup_many(namespace, block_hashes)
             .map_err(EngineError::Storage)?;
 
         // Clone data for thread

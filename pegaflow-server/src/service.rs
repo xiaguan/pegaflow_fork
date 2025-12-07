@@ -125,6 +125,7 @@ impl Engine for GrpcEngineService {
         self.engine
             .register_context_layer(
                 &req.instance_id,
+                &req.namespace,
                 metadata.device_id,
                 req.layer_name.clone(),
                 metadata.data_ptr,
@@ -199,7 +200,7 @@ impl Engine for GrpcEngineService {
     #[instrument(
         level = "info",
         skip(self, request),
-        fields(blocks=%request.get_ref().block_hashes.len()),
+        fields(instance=%request.get_ref().instance_id, blocks=%request.get_ref().block_hashes.len()),
         ret
     )]
     async fn query(
@@ -209,7 +210,7 @@ impl Engine for GrpcEngineService {
         let req = request.into_inner();
         let hit_blocks = self
             .engine
-            .count_prefix_hit_blocks(&req.block_hashes)
+            .count_prefix_hit_blocks(&req.instance_id, &req.block_hashes)
             .map_err(Self::map_engine_error)?;
 
         Ok(Response::new(QueryResponse {

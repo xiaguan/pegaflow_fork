@@ -19,6 +19,7 @@ message RegisterContextRequest {
   uint32 tp_rank = 9;
   uint32 tp_size = 10;
   uint32 num_layers = 11;
+  string namespace = 12;
 }
 
 message RegisterContextResponse {
@@ -57,7 +58,8 @@ message LoadResponse {
 }
 
 message QueryRequest {
-  repeated bytes block_hashes = 1;
+  string instance_id = 1;
+  repeated bytes block_hashes = 2;
 }
 
 message QueryResponse {
