@@ -1,0 +1,462 @@
+from __future__ import annotations
+"""
+Worker-side connector logic.
+"""
+
+import pickle
+import queue
+import threading
+import time
+from collections.abc import Iterable
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+import torch
+
+from pegaflow.connector.common import ConnectorContext, PegaConnectorMetadata, logger
+from pegaflow.logging_utils import timing_wrapper
+from pegaflow.ipc_wrapper import CudaIPCWrapper
+from pegaflow.pegaflow import PyLoadState
+
+if TYPE_CHECKING:
+    from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.forward_context import ForwardContext
+
+
+class WorkerConnector:
+    """Holds worker-only state and behaviors."""
+
+    def __init__(self, context: ConnectorContext):
+        self._ctx = context
+
+        self._save_queue = queue.Queue()
+        self._save_exception: Optional[Exception] = None
+        self._save_thread = threading.Thread(target=self._save_worker,
+                                             daemon=True,
+                                             name="PegaSaveWorker")
+        self._save_thread.start()
+
+        self._req_pending_layers: Dict[str, int] = {}
+        self._completed_saves: set[str] = set()
+        self._save_completion_lock = threading.Lock()
+
+        self._current_save_intents: set[str] = set()
+
+        self._pending_loads: Dict[str, PyLoadState] = {}
+        self._pending_load_reqs: Dict[str, set[str]] = {}
+        self._load_completion_lock = threading.Lock()
+
+        self._registered_layers: list[str] = []
+        self._layer_name_to_id: Dict[str, int] = {}
+
+    def shutdown(self) -> None:
+        self.unregister_context()
+        self._save_queue.put(None)
+        self._save_thread.join()
+
+    def unregister_context(self) -> None:
+        if not self._registered_layers:
+            return
+
+        if self._ctx.tp_rank == 0:
+            ok, message = self._ctx.engine_client.unregister_context(
+                self._ctx.instance_id)
+            if not ok:
+                logger.warning(
+                    f"[PegaKVConnector] Unregister context failed: {message}")
+
+        self._registered_layers.clear()
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        assert self._ctx.device_id is not None, "CUDA device id is unknown; cannot register KV caches"
+
+        self._registered_layers = list(kv_caches.keys())
+
+        self._layer_name_to_id.clear()
+        for layer_id, layer_name in enumerate(kv_caches.keys()):
+            self._layer_name_to_id[layer_name] = layer_id
+
+        layout = "unknown"
+        for layer_name, kv_cache in kv_caches.items():
+            assert kv_cache.storage_offset(
+            ) == 0, f"KV cache for {layer_name} must have zero storage offset"
+
+            wrapper = CudaIPCWrapper(kv_cache)
+            wrapper_bytes = pickle.dumps(wrapper)
+
+            shape = tuple(kv_cache.shape)
+            stride = tuple(kv_cache.stride())
+            element_size = kv_cache.element_size()
+
+            if len(shape) >= 2 and shape[0] == 2:
+                num_blocks = shape[1]
+                bytes_per_block = stride[1] * element_size
+                kv_stride_bytes = stride[0] * element_size
+                segments = 2
+                layout = "KV-first"
+            else:
+                num_blocks = shape[0]
+                bytes_per_block = stride[0] * element_size
+                kv_stride_bytes = 0
+                segments = 1
+                layout = "blocks-first"
+
+            assert bytes_per_block != 0, f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+
+            ok, message = self._ctx.engine_client.register_context(
+                self._ctx.instance_id,
+                self._ctx.namespace,
+                self._ctx.tp_rank,
+                self._ctx.tp_size,
+                self._ctx.device_id,
+                self._ctx.num_layers,
+                layer_name,
+                wrapper_bytes,
+                num_blocks,
+                bytes_per_block,
+                kv_stride_bytes,
+                segments,
+            )
+
+            if not ok:
+                raise RuntimeError(
+                    f"Register context failed for {layer_name}: {message}")
+
+        logger.info(
+            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
+            len(kv_caches),
+            layout,
+            self._ctx.instance_id,
+        )
+
+    def get_finished(
+            self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        finished_sending: set[str] | None = None
+        finished_recving: set[str] | None = None
+
+        with self._save_completion_lock:
+            done_saves = self._completed_saves & finished_req_ids
+            if done_saves:
+                self._completed_saves -= done_saves
+                finished_sending = done_saves
+
+        with self._load_completion_lock:
+            completed_reqs: set[str] = set()
+            completed_shms: list[str] = []
+
+            for shm_name, req_ids in self._pending_load_reqs.items():
+                sample_req_id = next(iter(req_ids))
+                load_state = self._pending_loads.get(sample_req_id)
+                if load_state is None:
+                    continue
+
+                if load_state.is_ready():
+                    state = load_state.get_state()
+                    if state < 0:
+                        logger.error(
+                            "[PegaKVConnector] async load failed with state=%d for reqs=%s",
+                            state,
+                            req_ids,
+                        )
+                    else:
+                        logger.debug(
+                            "[PegaKVConnector] async load completed for %d reqs, shm=%s",
+                            len(req_ids),
+                            shm_name,
+                        )
+                    completed_reqs.update(req_ids)
+                    completed_shms.append(shm_name)
+
+            for shm_name in completed_shms:
+                req_ids = self._pending_load_reqs.pop(shm_name, set())
+                for req_id in req_ids:
+                    self._pending_loads.pop(req_id, None)
+
+            if completed_reqs:
+                finished_recving = completed_reqs
+
+        if finished_sending:
+            logger.debug(
+                f"[PegaKVConnector] finished saving KV for requests: {finished_sending}"
+            )
+        if finished_recving:
+            logger.debug(
+                f"[PegaKVConnector] finished loading KV for requests: {finished_recving}"
+            )
+
+        return (finished_sending, finished_recving)
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        return set()
+
+    def get_kv_connector_stats(self):
+        return None
+
+    def get_handshake_metadata(self):
+        return None
+
+    def set_host_xfer_buffer_ops(self, copy_operation):
+        return
+
+    @timing_wrapper
+    def start_load_kv(self, metadata: PegaConnectorMetadata,
+                      forward_context: "ForwardContext",
+                      **kwargs: Any) -> None:
+        if not isinstance(metadata, PegaConnectorMetadata):
+            self._current_save_intents = set()
+            return
+
+        self._current_save_intents = set(metadata.save_intents.keys())
+
+        if not metadata.load_intents:
+            return
+
+        total_requests = len(metadata.load_intents)
+        load_start = time.perf_counter()
+
+        all_block_ids: List[int] = []
+        all_block_hashes: List[bytes] = []
+        request_ids: List[str] = []
+
+        for req_id, load_intent in metadata.load_intents.items():
+            all_block_ids.extend(load_intent.block_ids)
+            all_block_hashes.extend(load_intent.block_hashes)
+            request_ids.append(req_id)
+
+        if not all_block_ids:
+            return
+
+        target_layers: List[str] = []
+        for layer_name, layer in forward_context.no_compile_layers.items():
+            if hasattr(layer, 'kv_cache'):
+                target_layers.append(layer_name)
+
+        if not target_layers:
+            return
+
+        load_state = PyLoadState()
+        shm_name = load_state.shm_name()
+
+        ok, message = self._ctx.engine_client.load(
+            self._ctx.instance_id,
+            self._ctx.tp_rank,
+            self._ctx.device_id,
+            shm_name,
+            target_layers,
+            all_block_ids,
+            all_block_hashes,
+        )
+
+        if not ok:
+            raise RuntimeError(f"Load request failed: {message}")
+
+        num_layers = len(target_layers)
+        num_blocks = len(all_block_ids)
+
+        schedule_end = time.perf_counter()
+        schedule_time_us = (schedule_end - load_start) * 1e6
+
+        with self._load_completion_lock:
+            for req_id in request_ids:
+                self._pending_loads[req_id] = load_state
+            self._pending_load_reqs[shm_name] = set(request_ids)
+
+        logger.debug(
+            "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
+            "schedule %.0f us, shm=%s",
+            num_blocks,
+            num_layers,
+            total_requests,
+            schedule_time_us,
+            shm_name,
+        )
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        pass
+
+    def save_kv_layer(
+        self,
+        metadata: PegaConnectorMetadata,
+        layer_name: str,
+        kv_layer: "torch.Tensor",
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        if not isinstance(metadata, PegaConnectorMetadata):
+            return
+
+        request_ids = list(metadata.save_intents.keys())
+        if not request_ids:
+            return
+
+        with self._save_completion_lock:
+            for req_id in request_ids:
+                if req_id not in self._req_pending_layers:
+                    self._req_pending_layers[req_id] = len(
+                        self._registered_layers)
+
+        self._save_queue.put({
+            'layer_name': layer_name,
+            'attn_metadata': attn_metadata,
+            'metadata': metadata,
+            'request_ids': request_ids,
+        })
+
+    @timing_wrapper
+    def wait_for_save(self) -> None:
+        skipped_requests: set[str] = set()
+
+        with self._save_completion_lock:
+            pending_layers = set(self._req_pending_layers.keys())
+            skipped_requests = self._current_save_intents - pending_layers
+            if skipped_requests:
+                self._completed_saves.update(skipped_requests)
+
+            self._current_save_intents = set()
+
+            pending_reqs = len(self._req_pending_layers)
+            if pending_reqs > 0:
+                logger.debug(
+                    f"[PegaKVConnector] {pending_reqs} requests still have pending layer saves"
+                )
+
+        if skipped_requests:
+            logger.debug(
+                "[PegaKVConnector] Detected %d skipped saves (CUDA graph): %s",
+                len(skipped_requests),
+                skipped_requests,
+            )
+            self._handle_save_completion(skipped_requests,
+                                         reason="CUDA graph skip")
+
+    def _save_worker(self) -> None:
+        logger.info("[PegaKVConnector] Save worker thread started")
+
+        try:
+            while True:
+                task = self._save_queue.get()
+                if task is None:
+                    self._save_queue.task_done()
+                    break
+
+                batch = [task]
+                while True:
+                    try:
+                        t = self._save_queue.get_nowait()
+                        if t is None:
+                            self._process_save_batch(batch)
+                            self._save_queue.task_done()
+                            return
+                        batch.append(t)
+                    except queue.Empty:
+                        break
+
+                try:
+                    self._process_save_batch(batch)
+                except Exception as e:
+                    logger.error(f"[PegaKVConnector] Save worker error: {e}",
+                                 exc_info=True)
+                    self._save_exception = e
+                finally:
+                    for _ in batch:
+                        self._save_queue.task_done()
+
+        except Exception as e:
+            logger.critical(f"[PegaKVConnector] Save worker crashed: {e}",
+                            exc_info=True)
+            self._save_exception = e
+        finally:
+            logger.info("[PegaKVConnector] Save worker thread stopped")
+
+    def _process_save_batch(self, batch: list[dict]) -> None:
+        if not batch:
+            return
+
+        saves_by_layer: Dict[str, Dict[str, list]] = {}
+        all_request_ids: list[str] = []
+
+        for task in batch:
+            metadata: PegaConnectorMetadata = task['metadata']
+            attn_metadata = task['attn_metadata']
+            layer_name = task['layer_name']
+            request_ids = task.get('request_ids', [])
+
+            all_request_ids.extend(request_ids)
+
+            if attn_metadata.block_table is None:
+                continue
+
+            for _, save_intent in metadata.save_intents.items():
+                if not save_intent.block_ids:
+                    continue
+
+                if layer_name not in saves_by_layer:
+                    saves_by_layer[layer_name] = {
+                        'block_ids': [],
+                        'block_hashes': []
+                    }
+
+                saves_by_layer[layer_name]['block_ids'].extend(
+                    save_intent.block_ids)
+                saves_by_layer[layer_name]['block_hashes'].extend(
+                    save_intent.block_hashes)
+
+        if saves_by_layer:
+            saves_list = [(layer_name, list(data['block_ids']),
+                           list(data['block_hashes']))
+                          for layer_name, data in saves_by_layer.items()]
+
+            ok, message = self._ctx.engine_client.save(
+                self._ctx.instance_id,
+                self._ctx.tp_rank,
+                self._ctx.device_id,
+                saves_list,
+            )
+
+            if not ok:
+                raise RuntimeError(f"Save batch failed: {message}")
+
+            logger.debug(
+                "[PegaKVConnector] Batch saved %d layers, %d total blocks",
+                len(saves_list),
+                sum(len(s[1]) for s in saves_list),
+            )
+
+        self._decrement_layer_counter(all_request_ids)
+
+    def _decrement_layer_counter(self, request_ids: list[str]) -> None:
+        completed_reqs: list[str] = []
+
+        with self._save_completion_lock:
+            for req_id in request_ids:
+                if req_id in self._req_pending_layers:
+                    self._req_pending_layers[req_id] -= 1
+                    assert self._req_pending_layers[req_id] >= 0, \
+                        f"Layer count mismatch for request {req_id}: counter went negative"
+
+                    if self._req_pending_layers[req_id] == 0:
+                        self._completed_saves.add(req_id)
+                        del self._req_pending_layers[req_id]
+                        completed_reqs.append(req_id)
+
+        self._handle_save_completion(completed_reqs)
+
+    def _handle_save_completion(self,
+                                request_ids: Iterable[str],
+                                reason: str | None = None) -> None:
+        req_list = list(request_ids)
+        if not req_list:
+            return
+
+        suffix = "" if not reason else f" ({reason})"
+        layer_count = len(self._registered_layers) or self._ctx.num_layers
+        for req_id in req_list:
+            logger.debug(
+                "[PegaKVConnector] Request %s all %d layers saved%s",
+                req_id,
+                layer_count,
+                suffix,
+            )
+
+
+__all__ = ["WorkerConnector"]

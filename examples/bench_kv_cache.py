@@ -303,7 +303,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
+        default="Qwen/Qwen3-0.6B",
         help="Path or identifier for the model to benchmark (e.g. /work/models/Llama-3.1-8B)"
     )
     parser.add_argument(

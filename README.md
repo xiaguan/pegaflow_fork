@@ -77,7 +77,11 @@ We now ship a working vLLM v1 connector example plus a companion benchmark so yo
 3. Start the PegaEngine server (required before running examples):
 
    ```bash
-   cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+   # Set environment variables for PyO3
+   export PYO3_PYTHON=$(which python)
+   export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
+
+   cargo run -r -p pegaflow-server --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
    ```
 
    This starts the PegaEngine gRPC server that handles KV cache operations. Keep it running in a separate terminal.
