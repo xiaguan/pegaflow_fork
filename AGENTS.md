@@ -10,54 +10,59 @@ PegaFlow is a Rust-based key-value storage engine with Python bindings. The proj
 
 ```
 pegaflow/
-├── Cargo.toml              # Workspace configuration
-├── AGENTS.md               # This file - project documentation
-├── examples/               # Python usage examples
-│   ├── basic_usage.py      # PegaEngine basic operations
-│   └── basic_vllm.py       # vLLM integration example
-├── pega-core/              # Core Rust implementation
+├── Cargo.toml                 # Workspace configuration
+├── AGENTS.md                  # This file - project documentation
+├── README.md                  # Project overview
+├── assets/                    # Logos and images
+├── docs/                      # Additional docs (metrics, P/D setup)
+├── examples/                  # Python examples and benchmarks
+│   ├── basic_vllm.py
+│   ├── bench_kv_cache.py
+│   ├── run_vllm_pd_with_pega.py
+│   └── metric/                # Grafana/OTel compose configs
+├── pegaflow-core/             # Core Rust library (GPU-aware KV engine)
 │   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs          # PegaEngine implementation
-└── python/                 # Python package (published as "pegaflow")
-    ├── Cargo.toml          # Rust crate config for PyO3
-    ├── pyproject.toml      # Python package config
-    ├── README.md           # Python package documentation
-    ├── src/
-    │   └── lib.rs          # PyO3 bindings for PegaEngine
-    └── pegaflow/           # Python source code
-        ├── __init__.py     # Package entry point
-        └── connector.py    # vLLM KV connector implementation
+│   └── src/                   # Storage, transfer, pinned pool, metrics
+├── pegaflow-server/           # gRPC server + router binary
+│   ├── Cargo.toml
+│   ├── build.rs               # Prost/tonic codegen
+│   ├── proto/engine.proto     # Engine RPC definition
+│   └── src/                   # service, registry, proto glue, router bin
+└── python/                    # Python package (published as "pegaflow")
+    ├── Cargo.toml             # Rust crate config for PyO3
+    ├── pyproject.toml         # Python package config
+    ├── README.md              # Python package documentation
+    ├── src/lib.rs             # PyO3 bindings for PegaEngine + RPC client
+    └── pegaflow/              # Python source code
+        ├── __init__.py        # Package entry point
+        ├── connector/         # vLLM v1 connector (scheduler/worker)
+        ├── ipc_wrapper.py     # CUDA IPC tensor wrapper
+        └── logging_utils.py   # Connector logging helpers
 ```
 
 ## Architecture
 
-### pega-core
+### pegaflow-core
 
-The core Rust library that implements the storage engine:
+Core Rust library implementing the GPU-aware KV engine (pinned pool, block storage, async load/save, metrics).
 
-- **PegaEngine**: Main struct that wraps a HashMap for key-value storage
-- **Methods**:
-  - `new()`: Create a new engine instance
-  - `get(key)`: Retrieve a value by key
-  - `put(key, value)`: Insert or update a key-value pair
-  - `remove(key)`: Delete a key-value pair
+### pegaflow-server
+
+Tonic-based gRPC server wrapping `PegaEngine` plus a lightweight P/D router binary for disaggregated setups.
 
 ### python/
 
 The Python package layer (published as `pegaflow` on PyPI):
 
 #### Rust Extension (src/lib.rs)
-- Uses PyO3 to expose `PegaEngine` as a Python class
-- Wraps all core methods for Python consumption
+- Uses PyO3 to expose `PegaEngine` and the gRPC client for Python
 - Built as `pegaflow.pegaflow` extension module using maturin
 
 #### Python Package (pegaflow/)
 - **`__init__.py`**: Package entry point, exports `PegaEngine` and `PegaKVConnector`
-- **`connector.py`**: vLLM v1 KV connector implementation
-  - `PegaKVConnector`: Subclass of `KVConnectorBase_V1`
-  - Currently a skeleton implementation (methods raise `NotImplementedError`)
-  - Used by vLLM for distributed inference with KV cache transfer
+- **`connector/`**: vLLM v1 KV connector (scheduler/worker split, IPC handling)
+- **`ipc_wrapper.py`**: CUDA IPC tensor wrapper used during registration
+- **`logging_utils.py`**: Logging/timing helpers for the connector
 
 ## Development Workflow
 
@@ -91,22 +96,23 @@ The `examples/basic_usage.py` script demonstrates basic usage:
 
 The `examples/basic_vllm.py` script demonstrates vLLM integration:
 - Configure vLLM to use PegaKVConnector
-- Load a model (GPT-2) with KV transfer enabled
-- Generate text (currently fails at connector methods - expected for skeleton implementation)
+- Start the gRPC engine server (see README) and load a model with KV transfer enabled
+- Generate text twice to exercise cold/warm KV paths
 
 ## Agent Workflow
 
 When working on this project, agents should:
 
 1. **Understand the separation of concerns**:
-   - `pega-core`: Pure Rust logic, no Python dependencies
-   - `python/src/`: Python bindings only, delegates to pega-core
-   - `python/pegaflow/`: Pure Python utilities (vLLM connector, etc.)
+   - `pegaflow-core`: Pure Rust logic, no Python dependencies
+   - `pegaflow-server`: gRPC server and router wrapping `pegaflow-core`
+   - `python/src/`: Python bindings and RPC client only, delegates to `pegaflow-core`/server
+   - `python/pegaflow/`: Pure Python utilities (vLLM connector, logging, IPC)
 
 2. **Make changes in the correct layer**:
-   - Business logic changes → `pega-core`
+   - Business logic changes → `pegaflow-core`
    - Python API changes → `python/src/lib.rs`
-   - vLLM connector changes → `python/pegaflow/connector.py`
+   - vLLM connector changes → `python/pegaflow/connector/`
 
 3. **Test changes**:
    - Run `cargo test` for Rust tests
@@ -161,4 +167,3 @@ Potential areas for expansion:
 - Transaction support
 - Compression
 - Replication
-

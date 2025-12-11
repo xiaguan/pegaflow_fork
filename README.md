@@ -4,113 +4,71 @@
   <img src="./assets/logo.png" width="200" />
 </div>
 
+PegaFlow is a **high-performance KV cache offloading solution** for vLLM v1 on single-node multi-GPU setups.
+
+## What is PegaFlow?
+
+PegaFlow enables efficient KV cache transfer and sharing for vLLM inference workloads:
+
+- **Single-node KV cache offloading** — offload KV cache to host memory and restore it back to GPU with minimal latency
+- **Full parallelism support** — works with Pipeline Parallel (PP), Tensor Parallel (TP), and Data Parallel (DP)
+- **Layer-wise transfer** — fine-grained, layer-by-layer KV cache operations for optimal memory utilization
+- **P/D disaggregation** — separate prefill and decode phases across GPUs for better resource utilization
+- **~9x TTFT improvement** — warm-start requests achieve dramatically lower time-to-first-token compared to cold-start
+
 PegaFlow draws its name from Pegasus, the winged horse of ancient myth — a creature born to cross impossible distances with effortless grace.
 
-## Goals
+## Quick Start
 
-1. **A Data Path Purpose-Built for LLM Inference**
+### 1. Clone & Setup
 
-   Focus exclusively on the typical data flows in large model inference: data movement between prefill and decode phases, between different compute roles, and high-throughput transport of weights and KV/activations. We only solve this specific class of problems—high-bandwidth, predictable, structured data paths.
+```bash
+git clone https://github.com/xiaguan/pegaflow
+cd pegaflow
 
-2. **RDMA-First, High-Performance Implementation**
+uv venv
+source .venv/bin/activate
+uv pip install maturin
+uv pip install vllm
+```
 
-   The initial version prioritizes RDMA, leveraging static topology, long-lived connections, and pre-allocated resources to push throughput, stability, and tail latency close to hardware limits—validating the value of a "dedicated transport layer".
+### 2. Start PegaEngine Server
 
-3. **Developer-Friendly Abstractions**
+```bash
+# Set environment variables for PyO3
+export PYO3_PYTHON=$(which python)
+export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
 
-   Provide clear, minimal transport semantics and channel models: easy to understand, simple to integrate, and predictable in behavior. Avoid hidden policies that cause mysterious performance jitter, allowing users to make confident performance assumptions.
+# Start the server (keep running in a separate terminal)
+cargo run -r -p pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
+```
 
-4. **Built-In Observability and Tunability**
+**Server Options:**
+- `--addr`: Bind address (default: `127.0.0.1:50055`)
+- `--device`: CUDA device ID (default: `0`)
+- `--pool-size`: Pinned memory pool size (e.g., `10gb`, `500mb`, `1.5tb`)
 
-   Export key metrics and debugging information from day one (throughput, latency distribution, resource utilization, error signals, etc.), giving cluster operators data to guide topology and parameter tuning—rather than black-box trial-and-error.
+### 3. Build Python Bindings
 
-5. **Embeddable in Existing Inference Systems**
+```bash
+cd python
+maturin develop --release
+cd ..
+```
 
-   Serve as an optional "transport backend" that can plug into existing inference/dispatch/scheduling components—without requiring a full rewrite of the upper layers—ensuring the PoC can be validated quickly in real production stacks.
+### 4. Run Hello World
 
-## Non-Goals
+```bash
+uv run python examples/basic_vllm.py
+```
 
-1. **Not a General-Purpose RPC or Service Framework**
+The script loads GPT-2 through vLLM, runs a prompt twice (cold + warm), and shows the TTFT difference.
 
-   No request routing, load balancing, IDL, or serialization format wars—these concerns belong to upper layers or other projects.
-
-2. **Not a Universal Network Virtualization Layer**
-
-   No attempt to automatically adapt to all network environments, cloud providers, or dynamic topologies; the initial focus is deep optimization for known, controlled, performance-sensitive clusters.
-
-3. **Not a Full-Featured Communication Middleware**
-
-   Does not cover collectives, group communication semantics, or a comprehensive flow control ecosystem—only focused on high-value point-to-point (or few-node) bulk transfer scenarios.
-
-4. **Not a "Runs Everywhere" Compatibility Solution**
-
-   No compromising design sharpness for compatibility with low-spec or non-accelerated network environments; other protocols or software fallbacks are incremental extensions, not core promises.
-
-5. **Not a Security or Compliance Component**
-
-   No built-in complex authentication, encryption, or multi-tenant isolation; default assumption is deployment in controlled environments, with security handled by infrastructure.
-
-## Examples & Benchmarks
-
-We now ship a working vLLM v1 connector example plus a companion benchmark so you can validate PegaFlow end-to-end directly from [github.com/xiaguan/pegaflow](https://github.com/xiaguan/pegaflow).
-
-### Basic vLLM Connector ("Hello, world")
-
-`examples/basic_vllm.py` wires the PegaKVConnector into vLLM, runs a simple prompt twice, and shows the delta between cold/warm KV cache paths. A uv-driven workflow looks like this:
-
-1. Clone & enter the repo:
-
-   ```bash
-   git clone https://github.com/xiaguan/pegaflow
-   cd pegaflow
-   ```
-
-2. Provision a virtualenv and tooling:
-
-   ```bash
-   uv venv
-   source .venv/bin/activate
-   uv pip install maturin
-   uv install vllm
-   ```
-
-3. Start the PegaEngine server (required before running examples):
-
-   ```bash
-   # Set environment variables for PyO3
-   export PYO3_PYTHON=$(which python)
-   export LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
-
-   cargo run -r -p pegaflow-server --bin pegaflow-server -- --addr 0.0.0.0:50055 --device 0 --pool-size 30gb
-   ```
-
-   This starts the PegaEngine gRPC server that handles KV cache operations. Keep it running in a separate terminal.
-
-   **Configuration Options:**
-   - `--addr`: Server bind address (default: `127.0.0.1:50055`)
-   - `--device`: CUDA device ID (default: `0`)
-   - `--pool-size`: Pinned memory pool size with unit suffix (default: `30gb`)
-     - Examples: `10gb`, `500mb`, `1.5tb`, `1073741824` (bytes)
-
-4. Build the PyO3 bindings via maturin:
-
-   ```bash
-   cd python
-   maturin develop --release
-   cd ..
-   ```
-
-5. Run the hello-world connector example:
-
-   ```bash
-   uv run python examples/basic_vllm.py
-   ```
-
-The script loads GPT-2 through vLLM, runs a deterministic prompt twice, and prints both latencies so you can verify the connector is correctly persisting/restoring KV cache.
+## Benchmarks
 
 ### KV Cache Benchmark
 
-`examples/bench_kv_cache.py` automates a full TTFT-focused benchmark of PegaFlow's KV cache performance. Provide your own checkpoint path (we usually test with a Llama-3.1-8B variant on H800):
+`examples/bench_kv_cache.py` automates a full TTFT-focused benchmark. Provide your checkpoint path (we test with Llama-3.1-8B on H800):
 
 ```bash
 uv run python examples/bench_kv_cache.py \
@@ -209,3 +167,47 @@ Client Request
 | Baseline (DP2)| 438.24         | 22.67          | 24.32         | 142.70       |
 
 P/D disaggregation trades higher TTFT for **significantly more stable decode latency** — TPOT p99 drops from 24.32ms to 15.89ms, and ITL p99 improves dramatically from 142.70ms to 21.71ms.
+
+## Goals
+
+1. **A Data Path Purpose-Built for LLM Inference**
+
+   Focus exclusively on the typical data flows in large model inference: data movement between prefill and decode phases, between different compute roles, and high-throughput transport of weights and KV/activations. We only solve this specific class of problems—high-bandwidth, predictable, structured data paths.
+
+2. **RDMA-First, High-Performance Implementation**
+
+   The initial version prioritizes RDMA, leveraging static topology, long-lived connections, and pre-allocated resources to push throughput, stability, and tail latency close to hardware limits—validating the value of a "dedicated transport layer".
+
+3. **Developer-Friendly Abstractions**
+
+   Provide clear, minimal transport semantics and channel models: easy to understand, simple to integrate, and predictable in behavior. Avoid hidden policies that cause mysterious performance jitter, allowing users to make confident performance assumptions.
+
+4. **Built-In Observability and Tunability**
+
+   Export key metrics and debugging information from day one (throughput, latency distribution, resource utilization, error signals, etc.), giving cluster operators data to guide topology and parameter tuning—rather than black-box trial-and-error.
+
+5. **Embeddable in Existing Inference Systems**
+
+   Serve as an optional "transport backend" that can plug into existing inference/dispatch/scheduling components—without requiring a full rewrite of the upper layers—ensuring the PoC can be validated quickly in real production stacks.
+
+## Non-Goals
+
+1. **Not a General-Purpose RPC or Service Framework**
+
+   No request routing, load balancing, IDL, or serialization format wars—these concerns belong to upper layers or other projects.
+
+2. **Not a Universal Network Virtualization Layer**
+
+   No attempt to automatically adapt to all network environments, cloud providers, or dynamic topologies; the initial focus is deep optimization for known, controlled, performance-sensitive clusters.
+
+3. **Not a Full-Featured Communication Middleware**
+
+   Does not cover collectives, group communication semantics, or a comprehensive flow control ecosystem—only focused on high-value point-to-point (or few-node) bulk transfer scenarios.
+
+4. **Not a "Runs Everywhere" Compatibility Solution**
+
+   No compromising design sharpness for compatibility with low-spec or non-accelerated network environments; other protocols or software fallbacks are incremental extensions, not core promises.
+
+5. **Not a Security or Compliance Component**
+
+   No built-in complex authentication, encryption, or multi-tenant isolation; default assumption is deployment in controlled environments, with security handled by infrastructure.
