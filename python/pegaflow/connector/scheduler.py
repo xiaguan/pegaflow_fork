@@ -1,10 +1,10 @@
-from __future__ import annotations
 """
 Scheduler-side connector logic.
 """
 
 import time
-from typing import Dict, Iterable, Optional, Tuple, TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from pegaflow.connector.common import (
     ConnectorContext,
@@ -28,8 +28,8 @@ class SchedulerConnector:
 
     def __init__(self, context: ConnectorContext):
         self._ctx = context
-        self._trackers: Dict[str, RequestTracker] = {}
-        self._pending_load_intents: Dict[str, LoadIntent] = {}
+        self._trackers: dict[str, RequestTracker] = {}
+        self._pending_load_intents: dict[str, LoadIntent] = {}
         self._held_requests: set[str] = set()
 
     @timing_wrapper
@@ -37,7 +37,7 @@ class SchedulerConnector:
         self,
         request: "Request",
         num_computed_tokens: int,
-    ) -> Tuple[Optional[int], bool]:
+    ) -> tuple[int | None, bool]:
         req_id = request.request_id
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
@@ -90,12 +90,7 @@ class SchedulerConnector:
                 req_id)
             return
 
-        block_ids = []
-        if blocks is not None:
-            raw_block_ids = blocks.get_block_ids()
-            if raw_block_ids:
-                block_ids = list(raw_block_ids[0]) if raw_block_ids[0] else []
-
+        block_ids = list(blocks.get_block_ids()[0]) if blocks else []
         tracker.on_alloc(block_ids, num_external_tokens)
 
         if num_external_tokens > 0:
@@ -121,7 +116,7 @@ class SchedulerConnector:
     @timing_wrapper
     def build_connector_meta(
             self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
-        save_intents: Dict[str, SaveIntent] = {}
+        save_intents: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
         self._pending_load_intents = {}
@@ -153,8 +148,7 @@ class SchedulerConnector:
 
             new_block_ids = cached_reqs.new_block_ids[idx]
             if new_block_ids:
-                block_ids = list(new_block_ids[0]) if new_block_ids[0] else []
-                tracker.on_alloc(block_ids, 0)
+                tracker.on_alloc(list(new_block_ids[0]), 0)
 
             if save_intent := tracker.consume_save_intent():
                 save_intents[req_id] = save_intent
@@ -178,13 +172,15 @@ class SchedulerConnector:
                 while tracker._saved_layers < tracker._total_layers:
                     tracker.on_layer_saved()
                 logger.debug(
-                    f"[PegaKVConnector] Request {req_id} save completed, phase={tracker.phase.value}"
+                    "[PegaKVConnector] Request %s save completed, phase=%s",
+                    req_id,
+                    tracker.phase.value,
                 )
 
                 if tracker.is_done():
                     del self._trackers[req_id]
                     logger.debug(
-                        f"[PegaKVConnector] Cleaned up tracker for {req_id}")
+                        "[PegaKVConnector] Cleaned up tracker for %s", req_id)
 
     def request_finished(
         self,
@@ -200,7 +196,8 @@ class SchedulerConnector:
             if tracker.should_hold_blocks():
                 self._held_requests.add(req_id)
                 logger.debug(
-                    f"[PegaKVConnector] Request {req_id} blocks held for async save"
+                    "[PegaKVConnector] Request %s blocks held for async save",
+                    req_id,
                 )
                 return (True, None)
 
@@ -218,9 +215,6 @@ class SchedulerConnector:
         return self._trackers[req_id]
 
     def _count_available_block_prefix(self, block_hashes: Iterable[bytes]) -> int:
-        if not block_hashes:
-            return 0
-
         ok, message, hit_blocks = self._ctx.engine_client.query(
             self._ctx.instance_id, list(block_hashes))
         if not ok:

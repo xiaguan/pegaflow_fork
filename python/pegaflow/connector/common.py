@@ -1,4 +1,3 @@
-from __future__ import annotations
 """
 Shared types and helpers for the PegaFlow vLLM connector.
 """
@@ -8,12 +7,8 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorMetadata,
-    KVConnectorRole,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pegaflow import EngineRpcClient
@@ -144,9 +139,6 @@ class RequestTracker:
     def num_blocks(self) -> int:
         return len(self._block_hashes)
 
-    def _calc_hit_tokens(self) -> int:
-        return self._hit_blocks * self._block_size
-
     @property
     def _needs_load(self) -> bool:
         """Return True if we should load KV from external storage."""
@@ -175,7 +167,7 @@ class RequestTracker:
         self._finished = True
 
     # ========== Intent consumption ==========
-    def consume_load_intent(self) -> Optional[LoadIntent]:
+    def consume_load_intent(self) -> LoadIntent | None:
         if self._load_consumed or not self._needs_load:
             return None
 
@@ -197,7 +189,7 @@ class RequestTracker:
             num_tokens=load_blocks * self._block_size,
         )
 
-    def consume_save_intent(self) -> Optional[SaveIntent]:
+    def consume_save_intent(self) -> SaveIntent | None:
         saveable = min(
             len(self._block_hashes),
             len(self._allocated_blocks),
@@ -223,9 +215,6 @@ class RequestTracker:
     def is_done(self) -> bool:
         return self.phase == RequestPhase.DONE
 
-    def is_saving(self) -> bool:
-        return self._stored_blocks > 0
-
     def __repr__(self) -> str:
         return (
             f"RequestTracker(id={self.request_id}, phase={self.phase.value}, "
@@ -239,13 +228,13 @@ class PegaConnectorMetadata(KVConnectorMetadata):
 
     def __init__(
         self,
-        load_intents: Optional[Dict[str, LoadIntent]] = None,
-        save_intents: Optional[Dict[str, SaveIntent]] = None,
+        load_intents: dict[str, LoadIntent] | None = None,
+        save_intents: dict[str, SaveIntent] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
-        self.load_intents: Dict[str, LoadIntent] = load_intents or {}
-        self.save_intents: Dict[str, SaveIntent] = save_intents or {}
+        self.load_intents: dict[str, LoadIntent] = load_intents or {}
+        self.save_intents: dict[str, SaveIntent] = save_intents or {}
 
     def __repr__(self) -> str:
         return (f"PegaConnectorMetadata(loads={len(self.load_intents)}, "

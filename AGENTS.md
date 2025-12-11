@@ -117,9 +117,15 @@ When working on this project, agents should:
 4. **Follow Rust best practices**:
    - Use proper error handling
    - Follow ownership and borrowing rules
+   - Prefer `NonNull` over `*mut` in unsafe code
    - Write idiomatic Rust code
 
-5. **Follow PyO3 patterns**:
+5. **Follow Python style (3.9+)**:
+   - Use native generics (`list`, `dict`, `set`, `tuple`) instead of `typing.List`, `typing.Dict`, etc.
+   - Use PEP 604 union syntax (`X | Y`, `X | None`) instead of `typing.Union`, `typing.Optional`
+   - Logging: use `%s` formatting (`logger.info("x=%s", x)`) instead of f-strings to avoid evaluation overhead
+
+6. **Follow PyO3 patterns**:
    - Use `#[pyclass]` for Python-exposed structs
    - Use `#[pymethods]` for Python-exposed methods
    - Handle Python exceptions properly

@@ -80,10 +80,18 @@ vLLM Worker <--ZMQ--> PegaEngine Server <--CUDA IPC--> GPU Memory
 
 ## Code Conventions
 
+### General
 - Use English in comments
-- Prefer `NonNull` over `*mut` in Rust unsafe code
 - Use `.venv` for Python virtual environment
 - KV cache uses layer-first layout: all K blocks contiguous, followed by all V blocks
+
+### Rust
+- Prefer `NonNull` over `*mut` in unsafe code
+
+### Python (3.9+)
+- Use native generics (`list`, `dict`, `set`, `tuple`) instead of `typing.List`, `typing.Dict`, etc.
+- Use PEP 604 union syntax (`X | Y`, `X | None`) instead of `typing.Union`, `typing.Optional`
+- Logging: use `%s` formatting (`logger.info("x=%s", x)`) instead of f-strings to avoid evaluation overhead
 
 ## Environment Variables
 
