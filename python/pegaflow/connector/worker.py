@@ -378,6 +378,10 @@ class WorkerConnector:
                 saves_by_layer[task.layer_name][1].extend(save_intent.block_hashes)
 
         if saves_by_layer:
+            # Ensure all GPU kernels have completed before reading KV cache
+            # Otherwise we may copy uninitialized memory (attention kernel is async)
+            torch.cuda.synchronize()
+
             saves_list = [(name, ids, hashes)
                           for name, (ids, hashes) in saves_by_layer.items()]
 
