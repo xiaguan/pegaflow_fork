@@ -55,6 +55,9 @@ pub struct PinnedMemoryPool {
 }
 
 impl PinnedMemoryPool {
+    /// Upper bound for simultaneous allocations in the pinned pool.
+    const MAX_ALLOCS: u32 = 4_000_000;
+
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     pub fn new(pool_size: usize) -> Self {
         use cudarc::driver::sys;
@@ -73,8 +76,9 @@ impl PinnedMemoryPool {
             NonNull::new(pool_ptr as *mut u8).expect("cuMemAllocHost returned null pointer")
         };
 
-        let allocator = ScaledOffsetAllocator::new(pool_size as u64)
-            .expect("Failed to create memory allocator");
+        let allocator =
+            ScaledOffsetAllocator::new_with_max_allocs(pool_size as u64, Self::MAX_ALLOCS)
+                .expect("Failed to create memory allocator");
 
         Self {
             base_ptr,

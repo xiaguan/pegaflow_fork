@@ -81,11 +81,32 @@ impl ScaledOffsetAllocator {
         } else {
             1
         };
-        Self::new_with_unit_size(total_bytes, unit_size)
+        // Preserve the offset-allocator default cap of ~128k allocations.
+        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, 128 * 1024)
+    }
+
+    /// Same as `new` but allows the caller to control the maximum number of allocations.
+    pub fn new_with_max_allocs(total_bytes: u64, max_allocs: u32) -> Result<Self, AllocatorError> {
+        let max_units = u32::MAX as u64;
+        let unit_size = if total_bytes > max_units {
+            total_bytes.div_ceil(max_units)
+        } else {
+            1
+        };
+        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, max_allocs)
     }
 
     /// Create a new allocator that manages `total_bytes`, rounding up to multiples of `unit_size`.
     pub fn new_with_unit_size(total_bytes: u64, unit_size: u64) -> Result<Self, AllocatorError> {
+        Self::new_with_unit_size_and_max_allocs(total_bytes, unit_size, 128 * 1024)
+    }
+
+    /// Create a new allocator with explicit `unit_size` and `max_allocs`.
+    pub fn new_with_unit_size_and_max_allocs(
+        total_bytes: u64,
+        unit_size: u64,
+        max_allocs: u32,
+    ) -> Result<Self, AllocatorError> {
         let unit_size = NonZeroU64::new(unit_size).ok_or(AllocatorError::InvalidUnitSize)?;
 
         let total_units = total_bytes.div_ceil(unit_size.get());
@@ -98,7 +119,7 @@ impl ScaledOffsetAllocator {
         Ok(Self {
             unit_size,
             total_units: total_units_u32,
-            inner: RawAllocator::new(total_units_u32),
+            inner: RawAllocator::with_max_allocs(total_units_u32, max_allocs),
         })
     }
 
