@@ -9,6 +9,8 @@ pub(crate) struct CoreMetrics {
     pub pool_capacity_bytes: UpDownCounter<i64>,
     pub pool_alloc_failures: Counter<u64>,
 
+    pub inflight_blocks: UpDownCounter<i64>,
+
     pub cache_block_hits: Counter<u64>,
     pub cache_block_misses: Counter<u64>,
     pub cache_block_insertions: Counter<u64>,
@@ -86,6 +88,11 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             pool_alloc_failures: meter
                 .u64_counter("pegaflow_pool_alloc_failures_total")
                 .with_description("Pinned pool allocation failures after eviction retries")
+                .build(),
+
+            inflight_blocks: meter
+                .i64_up_down_counter("pegaflow_inflight_blocks")
+                .with_description("Current inflight (partial) blocks awaiting all slots")
                 .build(),
 
             cache_block_hits: meter

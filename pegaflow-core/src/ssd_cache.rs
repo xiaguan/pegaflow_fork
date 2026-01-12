@@ -443,7 +443,9 @@ pub async fn ssd_prefetch_loop(
         // Complete all prefetches
         for (key, begin, result, duration_secs, _block_size) in results {
             metrics.ssd_prefetch_inflight.add(-1, &[]);
-            metrics.ssd_prefetch_duration_seconds.record(duration_secs, &[]);
+            metrics
+                .ssd_prefetch_duration_seconds
+                .record(duration_secs, &[]);
 
             // Validate data wasn't overwritten during read
             let result = if result.is_some() && !handle.is_offset_valid(begin) {
