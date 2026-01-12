@@ -89,11 +89,11 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(pegaflow_cache_block_hits_total[5m])) / (sum(rate(pegaflow_cache_block_hits_total[5m])) + sum(rate(pegaflow_cache_block_misses_total[5m])))",
+          "expr": "sum(rate(pegaflow_cache_block_hits_total[1m])) / (sum(rate(pegaflow_cache_block_hits_total[1m])) + sum(rate(pegaflow_cache_block_misses_total[1m])))",
           "refId": "A"
         }
       ],
-      "title": "Cache Hit Ratio (5m)",
+      "title": "Cache Hit Ratio (1m)",
       "type": "gauge"
     },
     {
@@ -111,7 +111,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 8
       },
       "id": 3,
       "options": {
@@ -125,7 +125,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(pegaflow_rpc_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(pegaflow_rpc_duration_seconds_bucket[1m])))",
           "legendFormat": "p95 {{method}}",
           "refId": "A"
         }
@@ -148,7 +148,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 8
       },
       "id": 4,
       "options": {
@@ -162,7 +162,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(pegaflow_rpc_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(pegaflow_rpc_duration_seconds_bucket[1m])))",
           "legendFormat": "p99 {{method}}",
           "refId": "A"
         }
@@ -185,7 +185,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "id": 5,
       "options": {
@@ -222,7 +222,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 16
       },
       "id": 6,
       "options": {
@@ -273,7 +273,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(pegaflow_cache_block_hits_total[5m])) / (sum(rate(pegaflow_cache_block_hits_total[5m])) + sum(rate(pegaflow_cache_block_misses_total[5m])))",
+          "expr": "sum(rate(pegaflow_cache_block_hits_total[1m])) / (sum(rate(pegaflow_cache_block_hits_total[1m])) + sum(rate(pegaflow_cache_block_misses_total[1m])))",
           "legendFormat": "hit_ratio",
           "refId": "A"
         }
@@ -395,12 +395,12 @@
       "targets": [
         {
           "expr": "rate(pegaflow_save_bytes_total[1m])",
-          "legendFormat": "save bytes/s",
+          "legendFormat": "save",
           "refId": "A"
         },
         {
           "expr": "rate(pegaflow_load_bytes_total[1m])",
-          "legendFormat": "load bytes/s",
+          "legendFormat": "load",
           "refId": "B"
         }
       ],
@@ -414,7 +414,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -436,17 +436,27 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_save_duration_ms_milliseconds_bucket[5m])))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_save_duration_seconds_bucket[1m])))",
+          "legendFormat": "save p95",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_save_duration_ms_milliseconds_bucket[5m])))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_save_duration_seconds_bucket[1m])))",
+          "legendFormat": "save p99",
           "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_load_duration_seconds_bucket[1m])))",
+          "legendFormat": "load p95",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_load_duration_seconds_bucket[1m])))",
+          "legendFormat": "load p99",
+          "refId": "D"
         }
       ],
-      "title": "Save Latency",
+      "title": "Save / Load Latency",
       "type": "timeseries"
     },
     {
@@ -456,7 +466,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ms"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -478,17 +488,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_load_duration_ms_milliseconds_bucket[5m])))",
-          "legendFormat": "p95",
+          "expr": "rate(pegaflow_load_failures_total[1m])",
+          "legendFormat": "load failures",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_load_duration_ms_milliseconds_bucket[5m])))",
-          "legendFormat": "p99",
+          "expr": "rate(pegaflow_pool_alloc_failures_total[1m])",
+          "legendFormat": "pool alloc failures",
           "refId": "B"
         }
       ],
-      "title": "Load Latency",
+      "title": "Failure Rate",
       "type": "timeseries"
     },
     {
@@ -520,12 +530,200 @@
       },
       "targets": [
         {
-          "expr": "rate(pegaflow_load_failures_total[5m])",
-          "legendFormat": "load failures/s",
+          "expr": "rate(pegaflow_cache_block_evictions_total[1m])",
+          "legendFormat": "evictions",
           "refId": "A"
         }
       ],
-      "title": "Load Failure Rate",
+      "title": "Cache Eviction Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 14,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(pegaflow_ssd_write_bytes_total[1m])",
+          "legendFormat": "write",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pegaflow_ssd_prefetch_success_total[1m]) * avg(pegaflow_ssd_prefetch_throughput_bytes_per_second > 0)",
+          "legendFormat": "prefetch (approx)",
+          "refId": "B"
+        }
+      ],
+      "title": "SSD Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_ssd_write_duration_seconds_bucket[1m])))",
+          "legendFormat": "write p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_ssd_write_duration_seconds_bucket[1m])))",
+          "legendFormat": "write p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pegaflow_ssd_prefetch_duration_seconds_bucket[1m])))",
+          "legendFormat": "prefetch p95",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(pegaflow_ssd_prefetch_duration_seconds_bucket[1m])))",
+          "legendFormat": "prefetch p99",
+          "refId": "D"
+        }
+      ],
+      "title": "SSD Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "pegaflow_ssd_write_queue_pending",
+          "legendFormat": "write queue pending",
+          "refId": "A"
+        },
+        {
+          "expr": "pegaflow_ssd_prefetch_inflight",
+          "legendFormat": "prefetch inflight",
+          "refId": "B"
+        }
+      ],
+      "title": "SSD Queue Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(pegaflow_ssd_prefetch_success_total[1m])",
+          "legendFormat": "prefetch success",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(pegaflow_ssd_prefetch_failures_total[1m])",
+          "legendFormat": "prefetch failures",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(pegaflow_ssd_write_queue_full_total[1m])",
+          "legendFormat": "write queue full",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(pegaflow_ssd_prefetch_queue_full_total[1m])",
+          "legendFormat": "prefetch queue full",
+          "refId": "D"
+        }
+      ],
+      "title": "SSD Operations Rate",
       "type": "timeseries"
     }
   ],

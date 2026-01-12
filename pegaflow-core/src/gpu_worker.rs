@@ -302,8 +302,8 @@ fn process_load_task(task: &LoadTask, stream: &CudaStream) -> Result<(), EngineE
     if total_blocks > 0 {
         metrics.load_bytes.add(total_bytes as u64, &[]);
         metrics
-            .load_duration_ms
-            .record(elapsed.as_secs_f64() * 1000.0, &[]);
+            .load_duration_seconds
+            .record(elapsed.as_secs_f64(), &[]);
     }
 
     info!(

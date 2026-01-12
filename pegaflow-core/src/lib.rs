@@ -828,7 +828,7 @@ impl PegaEngine {
             .unwrap_or(0);
         if num_blocks > 0 {
             metrics.save_bytes.add(total_bytes, &[]);
-            metrics.save_duration_ms.record(elapsed * 1000.0, &[]);
+            metrics.save_duration_seconds.record(elapsed, &[]);
         }
         Ok(())
     }
