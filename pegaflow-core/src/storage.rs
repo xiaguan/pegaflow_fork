@@ -13,7 +13,7 @@
 // Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -391,10 +391,13 @@ impl StorageEngine {
         }
 
         // Get or create inflight block
-        let inflight_block = inner
-            .inflight
-            .entry(key.clone())
-            .or_insert_with(|| InflightBlock::new(total_slots));
+        let inflight_block = match inner.inflight.entry(key.clone()) {
+            Entry::Vacant(v) => {
+                core_metrics().inflight_blocks.add(1, &[]);
+                v.insert(InflightBlock::new(total_slots))
+            }
+            Entry::Occupied(o) => o.into_mut(),
+        };
 
         // Check if slot already exists
         if inflight_block.slot_exists(slot_id) {
@@ -406,6 +409,7 @@ impl StorageEngine {
         if completed {
             // Remove from inflight and seal
             let inflight_block = inner.inflight.remove(&key).expect("just checked");
+            core_metrics().inflight_blocks.add(-1, &[]);
             let sealed = Arc::new(inflight_block.seal());
 
             // Notify external consumers (fire-and-forget)
@@ -601,7 +605,7 @@ impl StorageEngine {
                     continue;
                 }
 
-                if inner.prefetching.contains(&key) || inner.inflight.contains_key(&key) {
+                if inner.prefetching.contains(&key) {
                     loading += 1;
                     continue;
                 }

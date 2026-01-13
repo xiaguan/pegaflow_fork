@@ -17,7 +17,7 @@ pub const DEFAULT_SSD_WRITE_QUEUE_DEPTH: usize = 8;
 /// Default prefetch queue depth (limits read tail latency)
 pub const DEFAULT_SSD_PREFETCH_QUEUE_DEPTH: usize = 2;
 
-/// Result of a single prefetch operation: (key, begin_offset, block, duration_ms, block_size)
+/// Result of a single prefetch operation: (key, begin_offset, block, duration_secs, block_size)
 type PrefetchResult = (BlockKey, u64, Option<Arc<SealedBlock>>, f64, u64);
 
 // ============================================================================
@@ -283,15 +283,15 @@ pub async fn ssd_writer_loop(
         let duration = write_start.elapsed();
         let duration_secs = duration.as_secs_f64();
         metrics
-            .ssd_write_duration_ms
-            .record(duration_secs * 1000.0, &[]);
+            .ssd_write_duration_seconds
+            .record(duration_secs, &[]);
 
-        // Record throughput in GB/s
+        // Record throughput in bytes/s
         if duration_secs > 0.0 && total_bytes_written > 0 {
-            let throughput_gbps = (total_bytes_written as f64) / duration_secs / 1e9;
+            let throughput_bytes_per_second = (total_bytes_written as f64) / duration_secs;
             metrics
-                .ssd_write_throughput_gbps
-                .record(throughput_gbps, &[]);
+                .ssd_write_throughput_bytes_per_second
+                .record(throughput_bytes_per_second, &[]);
         }
     }
 
@@ -441,9 +441,11 @@ pub async fn ssd_prefetch_loop(
         let results: Vec<PrefetchResult> = futures.collect().await;
 
         // Complete all prefetches
-        for (key, begin, result, duration_ms, _block_size) in results {
+        for (key, begin, result, duration_secs, _block_size) in results {
             metrics.ssd_prefetch_inflight.add(-1, &[]);
-            metrics.ssd_prefetch_duration_ms.record(duration_ms, &[]);
+            metrics
+                .ssd_prefetch_duration_seconds
+                .record(duration_secs, &[]);
 
             // Validate data wasn't overwritten during read
             let result = if result.is_some() && !handle.is_offset_valid(begin) {
@@ -460,13 +462,13 @@ pub async fn ssd_prefetch_loop(
             handle.complete_prefetch(key, result);
         }
 
-        // Record batch throughput
+        // Record batch throughput in bytes/s
         let duration_secs = batch_start.elapsed().as_secs_f64();
         if duration_secs > 0.0 && batch_bytes > 0 {
-            let throughput_gbps = (batch_bytes as f64) / duration_secs / 1e9;
+            let throughput_bytes_per_second = (batch_bytes as f64) / duration_secs;
             metrics
-                .ssd_prefetch_throughput_gbps
-                .record(throughput_gbps, &[]);
+                .ssd_prefetch_throughput_bytes_per_second
+                .record(throughput_bytes_per_second, &[]);
         }
     }
 
@@ -480,8 +482,8 @@ async fn execute_prefetch(
     capacity: u64,
 ) -> PrefetchResult {
     let start = Instant::now();
-    let duration_ms = || start.elapsed().as_secs_f64() * 1000.0;
-    let fail = |key, begin, size| (key, begin, None, duration_ms(), size);
+    let duration_secs = || start.elapsed().as_secs_f64();
+    let fail = |key, begin, size| (key, begin, None, duration_secs(), size);
 
     let key = req.key;
     let begin = req.entry.begin;
@@ -527,7 +529,7 @@ async fn execute_prefetch(
                         key,
                         begin,
                         Some(Arc::new(sealed)),
-                        duration_ms(),
+                        duration_secs(),
                         block_size,
                     ),
                     Err(e) => {
