@@ -207,6 +207,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         enable_lfu_admission: !cli.disable_lfu_admission,
         hint_value_size_bytes: cli.hint_value_size,
         ssd_cache_config,
+        ssd_prefetch_throttle: pegaflow_core::SsdPrefetchThrottleConfig::default(),
     };
 
     if cli.disable_lfu_admission {

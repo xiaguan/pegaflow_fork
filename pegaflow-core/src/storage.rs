@@ -29,6 +29,7 @@ use crate::ssd_cache::{
     ssd_prefetch_loop, ssd_writer_loop, PreallocatedSlice, PrefetchBatch, PrefetchRequest,
     SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
 };
+use crate::token_bucket::TokenBucket;
 
 // ============================================================================
 // Constants
@@ -40,6 +41,48 @@ const RECLAIM_BATCH_SIZE: usize = 64;
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
 pub const SSD_ALIGNMENT: usize = 512;
 
+/// Maximum number of blocks that can be prefetching concurrently from SSD.
+/// Based on: 15 GB/s SSD ÷ 24 MB/block × 200ms latency ≈ 128 blocks.
+const MAX_INFLIGHT_PREFETCH_BLOCKS: usize = 624;
+
+/// Maximum prefetch blocks per query to ensure fairness across requests.
+/// When a query already has this many blocks in prefetching state, we return
+/// Loading immediately without checking SSD, allowing scheduler to retry later.
+const DEFAULT_MAX_PREFETCH_PER_QUERY: usize = 16;
+
+/// Default max wait time for bandwidth bucket before rejecting prefetch (1 second).
+const DEFAULT_MAX_PREFETCH_WAIT_SECS: u64 = 1;
+
+/// Default SSD read bandwidth rate (20 GB/s).
+const DEFAULT_SSD_READ_RATE: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Default SSD read burst capacity (200 MB).
+const DEFAULT_SSD_READ_BURST: u64 = 200 * 1024 * 1024;
+
+/// Configuration for SSD prefetch throttling.
+#[derive(Debug, Clone)]
+pub struct SsdPrefetchThrottleConfig {
+    /// Max inflight prefetch blocks per query (default: 16)
+    pub max_per_query: usize,
+    /// Max wait time before rejecting prefetch (default: 1s)
+    pub max_wait_secs: u64,
+    /// Bandwidth rate in bytes/sec (default: 20 GB/s)
+    pub bandwidth_rate: u64,
+    /// Bandwidth burst capacity in bytes (default: 200 MB)
+    pub bandwidth_burst: u64,
+}
+
+impl Default for SsdPrefetchThrottleConfig {
+    fn default() -> Self {
+        Self {
+            max_per_query: DEFAULT_MAX_PREFETCH_PER_QUERY,
+            max_wait_secs: DEFAULT_MAX_PREFETCH_WAIT_SECS,
+            bandwidth_rate: DEFAULT_SSD_READ_RATE,
+            bandwidth_burst: DEFAULT_SSD_READ_BURST,
+        }
+    }
+}
+
 /// Configuration for cache + storage behavior.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -48,6 +91,8 @@ pub struct StorageConfig {
     pub hint_value_size_bytes: Option<usize>,
     /// Optional SSD cache for sealed blocks (single-node, FIFO).
     pub ssd_cache_config: Option<SsdCacheConfig>,
+    /// SSD prefetch throttling config (only used when ssd_cache_config is Some)
+    pub ssd_prefetch_throttle: SsdPrefetchThrottleConfig,
 }
 
 impl Default for StorageConfig {
@@ -56,6 +101,7 @@ impl Default for StorageConfig {
             enable_lfu_admission: true,
             hint_value_size_bytes: None,
             ssd_cache_config: None,
+            ssd_prefetch_throttle: SsdPrefetchThrottleConfig::default(),
         }
     }
 }
@@ -122,6 +168,12 @@ pub struct StorageEngine {
 
     /// SSD cache file handle and io_uring engine (if configured)
     ssd_state: Option<SsdState>,
+
+    /// SSD read bandwidth limiter (only active when SSD cache is enabled)
+    ssd_read_bucket: Option<TokenBucket>,
+
+    /// SSD prefetch throttle config
+    prefetch_throttle: SsdPrefetchThrottleConfig,
 }
 
 impl StorageEngine {
@@ -170,11 +222,24 @@ impl StorageEngine {
             None => (None, None),
         };
 
+        // Initialize SSD read bandwidth limiter if SSD cache is enabled
+        let ssd_read_bucket = if ssd_state.is_some() {
+            let throttle = &config.ssd_prefetch_throttle;
+            Some(TokenBucket::new(
+                throttle.bandwidth_rate,
+                throttle.bandwidth_burst,
+            ))
+        } else {
+            None
+        };
+
         let engine = Arc::new(Self {
             pinned_pool,
             inner,
             seal_notify_tx: Some(seal_notify_tx),
             ssd_state,
+            ssd_read_bucket,
+            prefetch_throttle: config.ssd_prefetch_throttle,
         });
 
         // Spawn SSD workers after Arc is created (they need callbacks into storage)
@@ -629,6 +694,12 @@ impl StorageEngine {
     /// Check prefix blocks and trigger prefetch for blocks in SSD.
     /// Returns status indicating whether caller should retry.
     /// Hit blocks are pinned to prevent eviction before load.
+    ///
+    /// Throttling rules:
+    /// 1. Per-query limit: if this query already has `max_per_query` blocks in prefetching,
+    ///    return Loading immediately without checking SSD (scheduler will retry later)
+    /// 2. Bandwidth limit: new prefetches from SSD are throttled by TokenBucket;
+    ///    if deficiency exceeds max_wait, treat remaining blocks as miss
     pub fn check_prefix_and_prefetch(
         &self,
         instance_id: &str,
@@ -638,7 +709,9 @@ impl StorageEngine {
         let mut hit = 0usize;
         let mut loading = 0usize;
         let mut missing = 0usize;
-        let mut to_prefetch: Vec<BlockKey> = Vec::new();
+        let mut to_prefetch: Vec<(BlockKey, SsdIndexEntry)> = Vec::new();
+        let max_per_query = self.prefetch_throttle.max_per_query;
+        let max_wait = std::time::Duration::from_secs(self.prefetch_throttle.max_wait_secs);
 
         {
             let mut inner = self.inner.lock().unwrap();
@@ -648,33 +721,72 @@ impl StorageEngine {
             for hash in hashes {
                 let key = BlockKey::new(namespace.to_string(), hash.clone());
 
-                // Then check cache
+                // Check cache first
                 if inner.cache.get(&key).is_some() {
                     hit += 1;
                     cpu_hit_keys.push(key);
                     continue;
                 }
 
+                // Check prefetching set
                 if inner.prefetching.contains(&key) {
                     loading += 1;
+                    // Rule 1: per-query limit on prefetching blocks
+                    if loading >= max_per_query {
+                        // Already at limit, return Loading without checking SSD
+                        // Scheduler will retry later when some prefetches complete
+                        core_metrics().ssd_prefetch_throttled_per_query.add(1, &[]);
+                        return PrefetchStatus::Loading { hit, loading };
+                    }
                     continue;
                 }
 
                 // Check SSD index
                 if let Some(entry) = inner.ssd_index.get(&key) {
                     if inner.ssd_tail <= entry.begin {
+                        // Rule 1: per-query limit on new prefetches
+                        if loading + to_prefetch.len() >= max_per_query {
+                            // Reached limit, treat remaining as miss
+                            core_metrics().ssd_prefetch_throttled_per_query.add(1, &[]);
+                            missing = hashes.len() - hit - loading - to_prefetch.len();
+                            break;
+                        }
+
+                        // Check global prefetch capacity
+                        if inner.prefetching.len() + to_prefetch.len()
+                            >= MAX_INFLIGHT_PREFETCH_BLOCKS
+                        {
+                            // SSD prefetch queue full, treat remaining as miss
+                            missing = hashes.len() - hit - loading - to_prefetch.len();
+                            break;
+                        }
+
+                        // Rule 2: bandwidth throttling
+                        if let Some(ref bucket) = self.ssd_read_bucket {
+                            let deficiency = bucket.grab_with_replenish(entry.len);
+                            if bucket.duration_for(deficiency) > max_wait {
+                                // Bandwidth exhausted, refund and treat remaining as miss
+                                bucket.refund(entry.len);
+                                core_metrics().ssd_prefetch_throttled_bandwidth.add(1, &[]);
+                                missing = hashes.len() - hit - loading - to_prefetch.len();
+                                break;
+                            }
+                        }
+
                         // Block is in SSD, schedule prefetch
-                        to_prefetch.push(key);
-                        loading += 1;
+                        to_prefetch.push((key, entry.clone()));
                         continue;
                     }
                 }
 
                 // Block not found anywhere - this is a miss
                 // For prefix matching, first miss means remaining blocks are also missing
-                missing = hashes.len() - hit - loading;
+                missing = hashes.len() - hit - loading - to_prefetch.len();
                 break;
             }
+
+            // Update loading count with new prefetches
+            loading += to_prefetch.len();
 
             // Pin hit blocks when returning Done (no loading in progress)
             if loading == 0 {
@@ -692,7 +804,8 @@ impl StorageEngine {
 
         // Trigger prefetch for blocks in SSD (outside lock)
         if !to_prefetch.is_empty() {
-            self.trigger_prefetch(to_prefetch);
+            let keys: Vec<BlockKey> = to_prefetch.into_iter().map(|(k, _)| k).collect();
+            self.trigger_prefetch(keys);
         }
 
         if loading > 0 {

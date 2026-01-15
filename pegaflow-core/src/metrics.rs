@@ -38,6 +38,10 @@ pub(crate) struct CoreMetrics {
     pub ssd_prefetch_throughput_bytes_per_second: Histogram<f64>,
     pub ssd_prefetch_inflight: UpDownCounter<i64>,
     pub ssd_prefetch_queue_full: Counter<u64>,
+
+    // SSD prefetch throttling metrics
+    pub ssd_prefetch_throttled_per_query: Counter<u64>,
+    pub ssd_prefetch_throttled_bandwidth: Counter<u64>,
 }
 
 fn init_meter() -> Meter {
@@ -202,6 +206,14 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             ssd_prefetch_queue_full: meter
                 .u64_counter("pegaflow_ssd_prefetch_queue_full_total")
                 .with_description("Prefetch requests dropped due to full queue")
+                .build(),
+            ssd_prefetch_throttled_per_query: meter
+                .u64_counter("pegaflow_ssd_prefetch_throttled_per_query_total")
+                .with_description("Prefetch requests throttled by per-query limit")
+                .build(),
+            ssd_prefetch_throttled_bandwidth: meter
+                .u64_counter("pegaflow_ssd_prefetch_throttled_bandwidth_total")
+                .with_description("Prefetch requests throttled by bandwidth limit")
                 .build(),
         }
     })

@@ -9,6 +9,7 @@ mod seal_offload;
 pub mod ssd_cache;
 mod storage;
 pub mod sync_state;
+pub mod token_bucket;
 mod transfer;
 mod uring;
 
@@ -20,7 +21,7 @@ pub use seal_offload::SlotMeta;
 pub use ssd_cache::{
     SsdCacheConfig, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_QUEUE_DEPTH,
 };
-pub use storage::{SealNotification, StorageConfig};
+pub use storage::{SealNotification, SsdPrefetchThrottleConfig, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
