@@ -140,6 +140,18 @@ def pega_metrics_port(request) -> int:
     return request.config.getoption("--pega-metrics-port")
 
 
+@pytest.fixture(scope="module")
+def tensor_parallel_size(request) -> int:
+    """Get tensor parallel size from command line."""
+    return request.config.getoption("--tensor-parallel-size")
+
+
+@pytest.fixture(scope="module")
+def pipeline_parallel_size(request) -> int:
+    """Get pipeline parallel size from command line."""
+    return request.config.getoption("--pipeline-parallel-size")
+
+
 @pytest.mark.fuzz
 class TestFuzzCorrectness:
     """Fuzz tests for PegaFlow using Zipf-distributed ShareGPT prompts."""
@@ -169,6 +181,8 @@ class TestFuzzCorrectness:
         base_port: int,
         pega_metrics_port: int,
         log_dir: Path,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
     ):
         """Verify PegaFlow produces identical outputs under Zipf workload.
 
@@ -192,8 +206,22 @@ class TestFuzzCorrectness:
         pegaflow_log = log_dir / "pegaflow_fuzz.log"
 
         with (
-            VLLMServer(model, base_port, use_pegaflow=False, log_file=baseline_log),
-            VLLMServer(model, base_port + 1, use_pegaflow=True, log_file=pegaflow_log),
+            VLLMServer(
+                model,
+                base_port,
+                use_pegaflow=False,
+                log_file=baseline_log,
+                tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
+            ),
+            VLLMServer(
+                model,
+                base_port + 1,
+                use_pegaflow=True,
+                log_file=pegaflow_log,
+                tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
+            ),
         ):
             metrics_start = fetch_pegaflow_metrics(pega_metrics_port)
 

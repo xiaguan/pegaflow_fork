@@ -13,6 +13,8 @@ from pathlib import Path
 
 import requests
 
+DEFAULT_VLLM_SEED = 42
+
 
 class VLLMServer:
     """Context manager for vLLM server lifecycle."""
@@ -24,18 +26,30 @@ class VLLMServer:
         use_pegaflow: bool = False,
         log_file: Path | None = None,
         max_model_len: int | None = None,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
     ):
         self.model = model
         self.port = port
         self.use_pegaflow = use_pegaflow
         self.log_file = log_file
         self.max_model_len = max_model_len
+        self.tensor_parallel_size = tensor_parallel_size
+        self.pipeline_parallel_size = pipeline_parallel_size
         self.health_endpoints = ["/health", "/v1/models"]
         self.process: subprocess.Popen | None = None
         self.log_handle = None
 
     def __enter__(self):
         """Start the vLLM server."""
+        if self.tensor_parallel_size < 1 or self.pipeline_parallel_size < 1:
+            raise ValueError("tensor/pipeline parallel sizes must be >= 1")
+        world_size = self.tensor_parallel_size * self.pipeline_parallel_size
+        if world_size > 4:
+            raise ValueError(
+                f"tensor_parallel_size * pipeline_parallel_size must be <= 4 (got {world_size})"
+            )
+
         env = os.environ.copy()
         env["VLLM_BATCH_INVARIANT"] = "1"
         if self.use_pegaflow:
@@ -53,6 +67,10 @@ class VLLMServer:
             "--no-enable-prefix-caching",
             "--attention-backend",
             "FLASH_ATTN",
+            "--tensor-parallel-size",
+            str(self.tensor_parallel_size),
+            "--pipeline-parallel-size",
+            str(self.pipeline_parallel_size),
         ]
 
         if self.max_model_len is not None:
@@ -168,13 +186,16 @@ def call_openai_api(
     prompt: str,
     max_tokens: int = 50,
     temperature: float = 0.0,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict:
     """Call vLLM's OpenAI-compatible API.
 
     Returns dict with 'text' and 'logprobs' (if available).
     """
     url = f"http://localhost:{port}/v1/completions"
+
+    if seed is None:
+        seed = DEFAULT_VLLM_SEED
 
     payload = {
         "model": model,

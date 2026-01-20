@@ -493,6 +493,22 @@ def pytest_addoption(parser):
         type=int,
         help="PegaFlow server metrics port for E2E tests",
     )
+    parser.addoption(
+        "--tensor-parallel-size",
+        "-tp",
+        action="store",
+        default=1,
+        type=int,
+        help="Tensor parallel size for vLLM servers in E2E/Fuzz tests (tp * pp <= 4)",
+    )
+    parser.addoption(
+        "--pipeline-parallel-size",
+        "-pp",
+        action="store",
+        default=1,
+        type=int,
+        help="Pipeline parallel size for vLLM servers in E2E/Fuzz tests (tp * pp <= 4)",
+    )
     # Fuzz test options
     parser.addoption(
         "--fuzz-seed",

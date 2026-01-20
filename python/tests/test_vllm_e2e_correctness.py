@@ -78,6 +78,18 @@ def pega_metrics_port(request) -> int:
     return request.config.getoption("--pega-metrics-port")
 
 
+@pytest.fixture(scope="module")
+def tensor_parallel_size(request) -> int:
+    """Get tensor parallel size from command line."""
+    return request.config.getoption("--tensor-parallel-size")
+
+
+@pytest.fixture(scope="module")
+def pipeline_parallel_size(request) -> int:
+    """Get pipeline parallel size from command line."""
+    return request.config.getoption("--pipeline-parallel-size")
+
+
 class TestE2ECorrectness:
     """E2E correctness tests for PegaFlow.
 
@@ -90,7 +102,13 @@ class TestE2ECorrectness:
         return tmp_path_factory.mktemp("vllm_logs")
 
     def test_cache_roundtrip_correctness(
-        self, model: str, base_port: int, pega_metrics_port: int, log_dir: Path
+        self,
+        model: str,
+        base_port: int,
+        pega_metrics_port: int,
+        log_dir: Path,
+        tensor_parallel_size: int,
+        pipeline_parallel_size: int,
     ):
         """Core contract: baseline, cold cache, and warm cache must produce identical outputs.
 
@@ -108,7 +126,14 @@ class TestE2ECorrectness:
         # Phase 1: Baseline vLLM (no PegaFlow)
         print("\n[Phase 1] Baseline vLLM")
         baseline_log = log_dir / "baseline.log"
-        with VLLMServer(model, base_port, use_pegaflow=False, log_file=baseline_log):
+        with VLLMServer(
+            model,
+            base_port,
+            use_pegaflow=False,
+            log_file=baseline_log,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ):
             for _, prompt in TEST_PROMPTS:
                 result = call_openai_api(base_port, model, prompt)
                 results["baseline"].append(result)
@@ -118,7 +143,14 @@ class TestE2ECorrectness:
         metrics_before_cold = fetch_pegaflow_metrics(pega_metrics_port)
 
         pegaflow_log = log_dir / "pegaflow.log"
-        with VLLMServer(model, base_port + 1, use_pegaflow=True, log_file=pegaflow_log):
+        with VLLMServer(
+            model,
+            base_port + 1,
+            use_pegaflow=True,
+            log_file=pegaflow_log,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ):
             # Cold cache run
             cold_total_time = 0.0
             for _, prompt in TEST_PROMPTS:
