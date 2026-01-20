@@ -495,7 +495,6 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--tensor-parallel-size",
-        "-tp",
         action="store",
         default=1,
         type=int,
@@ -503,7 +502,6 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--pipeline-parallel-size",
-        "-pp",
         action="store",
         default=1,
         type=int,

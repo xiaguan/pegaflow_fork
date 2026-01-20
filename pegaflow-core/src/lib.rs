@@ -843,12 +843,14 @@ impl PegaEngine {
     ) -> Result<PrefetchStatus, EngineError> {
         let instance = self.get_instance(instance_id)?;
         let namespace = &instance.namespace;
+        let tp_size = instance.tp_size;
         let metrics = core_metrics();
 
         // Delegate to storage engine's unified check_prefix_and_prefetch
-        let status = self
-            .storage
-            .check_prefix_and_prefetch(instance_id, namespace, block_hashes);
+        // Pass tp_size as num_workers so each TP worker can consume the pin once
+        let status =
+            self.storage
+                .check_prefix_and_prefetch(instance_id, namespace, block_hashes, tp_size);
 
         // Record metrics for terminal state
         match &status {
