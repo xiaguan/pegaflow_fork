@@ -486,6 +486,35 @@ def pytest_addoption(parser):
         type=int,
         help="Base port for vLLM servers in E2E tests",
     )
+    parser.addoption(
+        "--pega-metrics-port",
+        action="store",
+        default=9091,
+        type=int,
+        help="PegaFlow server metrics port for E2E tests",
+    )
+    # Fuzz test options
+    parser.addoption(
+        "--fuzz-seed",
+        action="store",
+        default=42,
+        type=int,
+        help="Random seed for fuzz test reproducibility",
+    )
+    parser.addoption(
+        "--fuzz-corpus",
+        action="store",
+        default=500,
+        type=int,
+        help="Number of unique prompts to sample from ShareGPT",
+    )
+    parser.addoption(
+        "--fuzz-requests",
+        action="store",
+        default=1000,
+        type=int,
+        help="Number of requests to generate in fuzz test",
+    )
 
 
 def pytest_configure(config):
@@ -497,4 +526,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "e2e: marks tests as end-to-end tests (require vLLM + PegaFlow)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "fuzz: marks tests as fuzz tests (long-running, skipped by default)",
     )
