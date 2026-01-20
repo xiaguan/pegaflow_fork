@@ -73,8 +73,6 @@ class VLLMServer:
             "--port",
             str(self.port),
             "--trust-remote-code",
-            "--block-size",
-            "64",
             "--no-enable-prefix-caching",
         ]
 
