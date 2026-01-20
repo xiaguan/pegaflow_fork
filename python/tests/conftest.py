@@ -471,9 +471,30 @@ def registered_instance(client_context: ClientContext) -> Generator[str, None, N
 # =============================================================================
 
 
+def pytest_addoption(parser):
+    """Add custom command line options for E2E tests."""
+    parser.addoption(
+        "--model",
+        action="store",
+        default="Qwen/Qwen3-0.6B",
+        help="Model to use for E2E testing",
+    )
+    parser.addoption(
+        "--e2e-port",
+        action="store",
+        default=8100,
+        type=int,
+        help="Base port for vLLM servers in E2E tests",
+    )
+
+
 def pytest_configure(config):
     """Configure custom pytest markers."""
     config.addinivalue_line(
         "markers",
         "integration: marks tests as integration tests (require PegaServer with GPU)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "e2e: marks tests as end-to-end tests (require vLLM + PegaFlow)",
     )
