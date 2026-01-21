@@ -306,6 +306,7 @@ impl EngineRpcClient {
     ///     namespace: Namespace for model isolation
     ///     tp_rank: Tensor parallel rank
     ///     tp_size: Total tensor parallel size
+    ///     world_size: Total worker count (TP * PP * PCP)
     ///     device_id: CUDA device ID
     ///     num_layers: Number of model layers
     ///     layer_name: Name of this layer
@@ -317,7 +318,7 @@ impl EngineRpcClient {
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
+    #[pyo3(signature = (instance_id, namespace, tp_rank, tp_size, world_size, device_id, num_layers, layer_name, wrapper_bytes, num_blocks, bytes_per_block, kv_stride_bytes, segments))]
     fn register_context(
         &self,
         py: Python<'_>,
@@ -325,6 +326,7 @@ impl EngineRpcClient {
         namespace: String,
         tp_rank: u32,
         tp_size: u32,
+        world_size: u32,
         device_id: i32,
         num_layers: u32,
         layer_name: String,
@@ -340,6 +342,7 @@ impl EngineRpcClient {
                     instance_id,
                     tp_rank,
                     tp_size,
+                    world_size,
                     device_id,
                     num_layers,
                     layer_name,

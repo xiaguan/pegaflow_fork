@@ -18,6 +18,7 @@ Usage:
 """
 
 import difflib
+import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -187,10 +188,9 @@ class TestFuzzCorrectness:
         """Verify PegaFlow produces identical outputs under Zipf workload.
 
         This test:
-        1. Starts baseline vLLM and PegaFlow-enabled vLLM servers
-        2. Sends the same Zipf-distributed request sequence to both
-        3. Verifies all outputs match exactly
-        4. Reports cache statistics
+        1. Runs baseline vLLM and saves all outputs
+        2. Runs PegaFlow-enabled vLLM and compares outputs
+        3. Reports cache statistics
         """
         if not check_pegaflow_server(pega_metrics_port):
             pytest.skip(
@@ -198,51 +198,83 @@ class TestFuzzCorrectness:
                 "Start with --metrics-addr flag."
             )
 
+        baseline_results: dict[str, dict] = {}
         failures: list[dict] = []
         stats = {"original": 0, "prefix_50pct": 0, "extended": 0}
-        processed = 0
 
         baseline_log = log_dir / "baseline_fuzz.log"
         pegaflow_log = log_dir / "pegaflow_fuzz.log"
 
-        with (
-            VLLMServer(
-                model,
-                base_port,
-                use_pegaflow=False,
-                log_file=baseline_log,
-                tensor_parallel_size=tensor_parallel_size,
-                pipeline_parallel_size=pipeline_parallel_size,
-            ),
-            VLLMServer(
-                model,
-                base_port + 1,
-                use_pegaflow=True,
-                log_file=pegaflow_log,
-                tensor_parallel_size=tensor_parallel_size,
-                pipeline_parallel_size=pipeline_parallel_size,
-            ),
+        # Phase 1: Run baseline and save results
+        print("\n[Fuzz] Phase 1: Running baseline vLLM")
+        with VLLMServer(
+            model,
+            base_port,
+            use_pegaflow=False,
+            log_file=baseline_log,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ):
+            for i, item in enumerate(access_sequence):
+                if (i + 1) % 100 == 0:
+                    print(f"[Fuzz] Baseline progress: {i + 1}/{len(access_sequence)}")
+                try:
+                    result = call_openai_api(base_port, model, item.prompt)
+                    baseline_results[item.prompt_id] = {
+                        "text": result["text"],
+                        "prompt": item.prompt,
+                        "access_type": item.access_type,
+                    }
+                except Exception as e:
+                    failures.append(
+                        {
+                            "prompt_id": item.prompt_id,
+                            "access_type": item.access_type,
+                            "prompt": item.prompt,
+                            "error": f"Baseline error: {e}",
+                        }
+                    )
+                    break
+
+        if failures:
+            raise AssertionError(self._format_failure(failures[0], log_dir, model, base_port))
+
+        # Phase 2: Run PegaFlow and compare
+        print(
+            f"\n[Fuzz] Phase 2: Running PegaFlow vLLM (comparing {len(baseline_results)} results)"
+        )
+        processed = 0
+        with VLLMServer(
+            model,
+            base_port,
+            use_pegaflow=True,
+            log_file=pegaflow_log,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
         ):
             metrics_start = fetch_pegaflow_metrics(pega_metrics_port)
 
             for i, item in enumerate(access_sequence):
+                if item.prompt_id not in baseline_results:
+                    continue
+
                 processed = i + 1
                 stats[item.access_type] += 1
 
                 if (i + 1) % 100 == 0:
-                    print(f"[Fuzz] Progress: {i + 1}/{len(access_sequence)}")
+                    print(f"[Fuzz] PegaFlow progress: {i + 1}/{len(access_sequence)}")
 
                 try:
-                    baseline = call_openai_api(base_port, model, item.prompt)
-                    pegaflow = call_openai_api(base_port + 1, model, item.prompt)
+                    pegaflow = call_openai_api(base_port, model, item.prompt)
+                    baseline_text = baseline_results[item.prompt_id]["text"]
 
-                    if baseline["text"] != pegaflow["text"]:
+                    if baseline_text != pegaflow["text"]:
                         failures.append(
                             {
                                 "prompt_id": item.prompt_id,
                                 "access_type": item.access_type,
                                 "prompt": item.prompt,
-                                "baseline": baseline["text"],
+                                "baseline": baseline_text,
                                 "pegaflow": pegaflow["text"],
                             }
                         )
@@ -253,7 +285,7 @@ class TestFuzzCorrectness:
                             "prompt_id": item.prompt_id,
                             "access_type": item.access_type,
                             "prompt": item.prompt,
-                            "error": str(e),
+                            "error": f"PegaFlow error: {e}",
                         }
                     )
                     break
@@ -264,7 +296,7 @@ class TestFuzzCorrectness:
         self._print_report(access_sequence, processed, stats, metrics_start, metrics_end, failures)
 
         if failures:
-            raise AssertionError(self._format_failure(failures[0]))
+            raise AssertionError(self._format_failure(failures[0], log_dir, model, base_port))
 
     def _print_report(
         self,
@@ -305,15 +337,23 @@ class TestFuzzCorrectness:
         print(f"  Failures: {len(failures)}")
         print(f"{'=' * 60}\n")
 
-    def _format_failure(self, failure: dict) -> str:
+    def _format_failure(
+        self, failure: dict, log_dir: Path | None = None, model: str = "", port: int = 8100
+    ) -> str:
         """Format a readable failure message for quick diffing."""
-        prompt = self._snippet(failure.get("prompt", ""))
+        prompt = failure.get("prompt", "")
+        prompt_id = failure.get("prompt_id", "unknown")
+
+        # Dump the request to a JSON file for manual replay
+        if log_dir is not None:
+            self._dump_replay_request(failure, log_dir, model, port)
+
         if "error" in failure:
             return (
                 "[Fuzz Error]\n"
-                f"  prompt_id: {failure.get('prompt_id')}\n"
+                f"  prompt_id: {prompt_id}\n"
                 f"  access_type: {failure.get('access_type')}\n"
-                f"  prompt: {prompt}\n"
+                f"  prompt: {self._snippet(prompt)}\n"
                 f"  error: {failure.get('error')}"
             )
 
@@ -335,14 +375,45 @@ class TestFuzzCorrectness:
 
         return (
             "[Fuzz Mismatch]\n"
-            f"  prompt_id: {failure.get('prompt_id')}\n"
+            f"  prompt_id: {prompt_id}\n"
             f"  access_type: {failure.get('access_type')}\n"
-            f"  prompt: {prompt}\n"
+            f"  prompt: {self._snippet(prompt)}\n"
             f"  baseline: {self._snippet(baseline)}\n"
             f"  pegaflow: {self._snippet(pegaflow)}\n"
             "  diff:\n"
             f"{diff}"
         )
+
+    def _dump_replay_request(self, failure: dict, log_dir: Path, model: str, port: int) -> None:
+        """Dump the failing request to JSON for manual replay with curl."""
+        prompt = failure.get("prompt", "")
+        prompt_id = failure.get("prompt_id", "unknown")
+
+        # Save full failure info
+        failure_file = log_dir / f"failure_{prompt_id}.json"
+        with open(failure_file, "w") as f:
+            json.dump(failure, f, indent=2, ensure_ascii=False)
+
+        # Save curl-ready request payload
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 50,
+            "temperature": 0.0,
+            "seed": 42,
+            "logprobs": 5,
+        }
+        request_file = log_dir / f"request_{prompt_id}.json"
+        with open(request_file, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        print(f"\n[Debug] Failure dumped to: {log_dir}")
+        print(f"  - Full failure: {failure_file}")
+        print(f"  - Request payload: {request_file}")
+        print("\n[Debug] Replay with curl:")
+        print(f"  curl -X POST http://localhost:{port}/v1/completions \\")
+        print("    -H 'Content-Type: application/json' \\")
+        print(f"    -d @{request_file}")
 
     @staticmethod
     def _snippet(text: str, max_len: int = 200) -> str:

@@ -70,11 +70,12 @@ class SchedulerConnector:
 
         logger.info(
             "[PegaKVConnector] hit_blocks=%d computed_blocks=%d need_to_compute_tokens=%d "
-            "hit_tokens=%d elapsed_us=%.0f for request %s",
+            "hit_tokens=%d num_tokens=%d elapsed_us=%.0f for request %s",
             hit_blocks,
             computed_blocks,
             need_to_compute_tokens,
             num_hit_tokens,
+            num_tokens,
             elapsed_us,
             req_id,
         )
@@ -98,6 +99,12 @@ class SchedulerConnector:
             return
 
         block_ids = list(blocks.get_block_ids()[0]) if blocks else []
+        logger.info(
+            "[PegaKVConnector] update_state_after_alloc req=%s ALL_block_ids=%s num_external_tokens=%d",
+            req_id,
+            block_ids,  # full list
+            num_external_tokens,
+        )
         tracker.on_alloc(block_ids, num_external_tokens)
 
         # Always consume to clear _load state, avoiding stale state on preemption

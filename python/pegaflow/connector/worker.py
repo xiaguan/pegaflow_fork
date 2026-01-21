@@ -119,6 +119,7 @@ class WorkerConnector:
                 self._ctx.namespace,
                 self._ctx.tp_rank,
                 self._ctx.tp_size,
+                self._ctx.world_size,
                 self._ctx.device_id,
                 self._ctx.num_layers,
                 layer_name,
@@ -226,6 +227,12 @@ class WorkerConnector:
             all_block_ids.extend(load_intent.block_ids)
             all_block_hashes.extend(load_intent.block_hashes)
             request_ids.append(req_id)
+            logger.info(
+                "[PegaKVConnector] LOAD_INTENT req=%s ALL_block_ids=%s num_tokens=%d",
+                req_id,
+                list(load_intent.block_ids),  # full list
+                load_intent.num_tokens,
+            )
 
         if not all_block_ids:
             return

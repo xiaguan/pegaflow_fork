@@ -52,10 +52,6 @@ class VLLMServer:
 
         env = os.environ.copy()
         env["VLLM_BATCH_INVARIANT"] = "1"
-        if self.use_pegaflow:
-            env["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
-        else:
-            env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
         cmd = [
             "vllm",
