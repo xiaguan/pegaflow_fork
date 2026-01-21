@@ -61,6 +61,8 @@ class VLLMServer:
             str(self.port),
             "--trust-remote-code",
             "--no-enable-prefix-caching",
+            "--gpu-memory-utilization",
+            "0.8",
             "--attention-backend",
             "FLASH_ATTN",
             "--tensor-parallel-size",
