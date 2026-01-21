@@ -99,12 +99,6 @@ class SchedulerConnector:
             return
 
         block_ids = list(blocks.get_block_ids()[0]) if blocks else []
-        logger.info(
-            "[PegaKVConnector] update_state_after_alloc req=%s ALL_block_ids=%s num_external_tokens=%d",
-            req_id,
-            block_ids,  # full list
-            num_external_tokens,
-        )
         tracker.on_alloc(block_ids, num_external_tokens)
 
         # Always consume to clear _load state, avoiding stale state on preemption
