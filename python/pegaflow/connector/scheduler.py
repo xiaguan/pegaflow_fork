@@ -14,7 +14,6 @@ from pegaflow.connector.common import (
     SaveIntent,
     logger,
 )
-from pegaflow.logging_utils import timing_wrapper
 from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
@@ -34,7 +33,6 @@ class SchedulerConnector:
         self._held_requests: set[str] = set()
         self._prefetch_start_times: dict[str, float] = {}  # req_id -> start time
 
-    @timing_wrapper
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -60,29 +58,26 @@ class SchedulerConnector:
         tracker.on_lookup(hit_blocks, computed_blocks)
 
         num_hit_tokens = hit_blocks * self._ctx.block_size - num_computed_tokens
+
+        logger.info(
+            "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
+            "hit_tokens=%d num_tokens=%d lookup_us=%.0f",
+            req_id,
+            hit_blocks,
+            computed_blocks,
+            num_hit_tokens,
+            num_tokens,
+            elapsed_us,
+        )
+
         if num_hit_tokens <= 0:
             return (0, False)
 
         if num_hit_tokens >= num_tokens:
             num_hit_tokens = num_tokens - 1
 
-        need_to_compute_tokens = num_tokens - num_hit_tokens
-
-        logger.info(
-            "[PegaKVConnector] hit_blocks=%d computed_blocks=%d need_to_compute_tokens=%d "
-            "hit_tokens=%d num_tokens=%d elapsed_us=%.0f for request %s",
-            hit_blocks,
-            computed_blocks,
-            need_to_compute_tokens,
-            num_hit_tokens,
-            num_tokens,
-            elapsed_us,
-            req_id,
-        )
-
         return (num_hit_tokens, True)
 
-    @timing_wrapper
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -121,7 +116,6 @@ class SchedulerConnector:
             tracker.phase.value,
         )
 
-    @timing_wrapper
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
         save_intents: dict[str, SaveIntent] = {}
 
