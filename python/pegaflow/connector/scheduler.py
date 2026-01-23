@@ -77,9 +77,6 @@ class SchedulerConnector:
         if num_hit_tokens <= 0:
             return (0, False)
 
-        if num_hit_tokens >= num_tokens:
-            num_hit_tokens = num_tokens - 1
-
         return (num_hit_tokens, True)
 
     def update_state_after_alloc(

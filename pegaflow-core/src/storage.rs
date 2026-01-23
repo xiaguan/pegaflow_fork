@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::block::{
     BlockHash, BlockInsertError, BlockKey, InflightBlock, LayerBlock, PrefetchStatus, SealedBlock,
 };
-use crate::cache::TinyLfuCache;
+use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 use crate::ssd_cache::{
@@ -39,6 +39,54 @@ const RECLAIM_BATCH_SIZE: usize = 64;
 
 /// SSD I/O alignment requirement (O_DIRECT requires 512-byte aligned I/O)
 pub const SSD_ALIGNMENT: usize = 512;
+
+// ============================================================================
+// Metrics helpers (keep insert/evict logic together for easy audit)
+// ============================================================================
+
+/// Records metrics when bytes are added to inflight blocks.
+fn record_inflight_bytes_added(bytes: u64) {
+    if let Ok(v) = i64::try_from(bytes) {
+        core_metrics().inflight_bytes.add(v, &[]);
+    }
+}
+
+/// Records metrics when bytes are removed from inflight blocks (seal or gc).
+fn record_inflight_bytes_removed(bytes: u64) {
+    if let Ok(v) = i64::try_from(bytes) {
+        core_metrics().inflight_bytes.add(-v, &[]);
+    }
+}
+
+/// Records metrics for a new cache insertion.
+fn record_cache_insert_new(footprint_bytes: u64) {
+    let m = core_metrics();
+    m.cache_block_insertions.add(1, &[]);
+    if let Ok(v) = i64::try_from(footprint_bytes) {
+        m.cache_resident_bytes.add(v, &[]);
+    }
+}
+
+/// Records metrics for a cache eviction.
+fn record_cache_eviction(footprint_bytes: u64) {
+    if let Ok(v) = i64::try_from(footprint_bytes) {
+        core_metrics().cache_resident_bytes.add(-v, &[]);
+    }
+}
+
+/// Records metrics when a new unique block is pinned.
+fn record_pin_unique_added(footprint_bytes: u64) {
+    if let Ok(v) = i64::try_from(footprint_bytes) {
+        core_metrics().pinned_for_load_unique_bytes.add(v, &[]);
+    }
+}
+
+/// Records metrics when the last reference to a unique block is unpinned.
+fn record_pin_unique_removed(footprint_bytes: u64) {
+    if let Ok(v) = i64::try_from(footprint_bytes) {
+        core_metrics().pinned_for_load_unique_bytes.add(-v, &[]);
+    }
+}
 
 /// Configuration for cache + storage behavior.
 #[derive(Debug, Clone)]
@@ -108,6 +156,9 @@ struct StorageInner {
     /// Pinned blocks between query and load (prevents eviction race)
     /// Key: (instance_id, block_key), Value: (block, ref_count)
     pinned_for_load: HashMap<(String, BlockKey), (Arc<SealedBlock>, usize)>,
+    /// Aggregated pinned_for_load refcounts by block key (for attribution metrics).
+    /// Value: (footprint_bytes, total_refcount)
+    pinned_for_load_by_key: HashMap<BlockKey, (u64, usize)>,
 }
 
 pub struct StorageEngine {
@@ -153,6 +204,7 @@ impl StorageEngine {
             ssd_index: HashMap::new(),
             ssd_tail: 0,
             pinned_for_load: HashMap::new(),
+            pinned_for_load_by_key: HashMap::new(),
         });
 
         // Create unbounded channel for seal notifications
@@ -411,10 +463,7 @@ impl StorageEngine {
 
         // Get or create inflight block
         let inflight_block = match inner.inflight.entry(key.clone()) {
-            Entry::Vacant(v) => {
-                core_metrics().inflight_blocks.add(1, &[]);
-                v.insert(InflightBlock::new(total_slots))
-            }
+            Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
             Entry::Occupied(o) => o.into_mut(),
         };
 
@@ -423,12 +472,15 @@ impl StorageEngine {
             return Ok(None);
         }
 
+        let slot_footprint = block.memory_footprint();
         let completed = inflight_block.insert_slot(slot_id, block, total_slots)?;
+        record_inflight_bytes_added(slot_footprint);
 
         if completed {
             // Remove from inflight and seal
             let inflight_block = inner.inflight.remove(&key).expect("just checked");
-            core_metrics().inflight_blocks.add(-1, &[]);
+            let total_footprint = inflight_block.footprint();
+            record_inflight_bytes_removed(total_footprint);
             let sealed = Arc::new(inflight_block.seal());
 
             // Notify external consumers (fire-and-forget)
@@ -447,12 +499,21 @@ impl StorageEngine {
     /// Returns true if admitted, false if rejected.
     pub fn cache_admit(&self, key: BlockKey, block: Arc<SealedBlock>) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.cache.insert(key, block) {
-            core_metrics().cache_block_insertions.add(1, &[]);
-            true
-        } else {
-            core_metrics().cache_block_admission_rejections.add(1, &[]);
-            false
+        let footprint_bytes = block.memory_footprint();
+
+        match inner.cache.insert(key, block) {
+            CacheInsertOutcome::InsertedNew => {
+                record_cache_insert_new(footprint_bytes);
+                true
+            }
+            CacheInsertOutcome::AlreadyExists => {
+                // No overwrite, no-op for metrics.
+                true
+            }
+            CacheInsertOutcome::Rejected => {
+                core_metrics().cache_block_admission_rejections.add(1, &[]);
+                false
+            }
         }
     }
 
@@ -512,12 +573,35 @@ impl StorageEngine {
             let pin_key = (instance_id.to_string(), key.clone());
 
             // Consume pinned_for_load (ref_count -1, remove if 0)
-            if let Some((block, count)) = inner.pinned_for_load.get_mut(&pin_key) {
+            if let Entry::Occupied(mut entry) = inner.pinned_for_load.entry(pin_key) {
+                let (block, count) = entry.get_mut();
                 let cloned = Arc::clone(block);
                 *count -= 1;
+
                 if *count == 0 {
-                    inner.pinned_for_load.remove(&pin_key);
+                    entry.remove();
                 }
+
+                // Track unique block removal
+                let mut unique_bytes_to_remove: Option<u64> = None;
+                if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&key) {
+                    *total = total.saturating_sub(1);
+                    if *total == 0 {
+                        unique_bytes_to_remove = Some(*bytes);
+                    }
+                } else {
+                    error!(
+                        "BUG: pinned_for_load_by_key missing key during consume: namespace={} hash_len={}",
+                        key.namespace,
+                        key.hash.len()
+                    );
+                }
+
+                if let Some(bytes) = unique_bytes_to_remove {
+                    inner.pinned_for_load_by_key.remove(&key);
+                    record_pin_unique_removed(bytes);
+                }
+
                 result.push(cloned);
             } else {
                 error!(
@@ -556,7 +640,7 @@ impl StorageEngine {
         let mut unpinned = 0usize;
 
         for key in keys {
-            let pin_key = (instance_id.to_string(), key);
+            let pin_key = (instance_id.to_string(), key.clone());
 
             if let Some((_, count)) = inner.pinned_for_load.get_mut(&pin_key) {
                 *count = count.saturating_sub(1);
@@ -564,6 +648,20 @@ impl StorageEngine {
                     inner.pinned_for_load.remove(&pin_key);
                 }
                 unpinned += 1;
+
+                // Track unique block removal
+                let mut unique_bytes_to_remove: Option<u64> = None;
+                if let Some((bytes, total)) = inner.pinned_for_load_by_key.get_mut(&key) {
+                    *total = total.saturating_sub(1);
+                    if *total == 0 {
+                        unique_bytes_to_remove = Some(*bytes);
+                    }
+                }
+
+                if let Some(bytes) = unique_bytes_to_remove {
+                    inner.pinned_for_load_by_key.remove(&key);
+                    record_pin_unique_removed(bytes);
+                }
             }
         }
 
@@ -584,6 +682,8 @@ impl StorageEngine {
         let mut largest_free = self.pinned_pool.largest_free_allocation();
 
         while largest_free < required_bytes {
+            let used_before = self.pinned_pool.usage().0;
+
             // Collect evicted blocks under lock, then drop outside lock
             let evicted: Vec<_> = {
                 let mut inner = self.inner.lock().unwrap();
@@ -596,9 +696,33 @@ impl StorageEngine {
                 break;
             }
 
-            for (_key, block) in evicted {
-                freed_bytes = freed_bytes.saturating_add(block.memory_footprint());
-                freed_blocks += 1;
+            let mut batch_bytes = 0u64;
+            let mut still_referenced = 0u64;
+            for (_key, block) in evicted.iter() {
+                let b = block.memory_footprint();
+                batch_bytes = batch_bytes.saturating_add(b);
+                if Arc::strong_count(block) > 1 {
+                    still_referenced += 1;
+                }
+                record_cache_eviction(b);
+            }
+
+            if still_referenced > 0 {
+                core_metrics()
+                    .cache_block_evictions_still_referenced
+                    .add(still_referenced, &[]);
+            }
+
+            freed_bytes = freed_bytes.saturating_add(batch_bytes);
+            freed_blocks += evicted.len();
+
+            drop(evicted); // allow allocation drops to run before sampling allocator usage
+            let used_after = self.pinned_pool.usage().0;
+            let reclaimed = used_before.saturating_sub(used_after);
+            if reclaimed > 0 {
+                core_metrics()
+                    .cache_eviction_reclaimed_bytes
+                    .add(reclaimed, &[]);
             }
 
             largest_free = self.pinned_pool.largest_free_allocation();
@@ -642,8 +766,7 @@ impl StorageEngine {
                     block.total_slots(),
                     age.as_secs()
                 );
-                // Decrement the inflight gauge for each removed block
-                core_metrics().inflight_blocks.add(-1, &[]);
+                record_inflight_bytes_removed(block.footprint());
                 false
             } else {
                 true
@@ -719,11 +842,26 @@ impl StorageEngine {
                 for key in cpu_hit_keys {
                     let pin_key = (instance_id.to_string(), key.clone());
                     let block = inner.cache.get(&key).unwrap();
-                    inner
-                        .pinned_for_load
-                        .entry(pin_key)
-                        .and_modify(|(_, count)| *count += num_workers)
-                        .or_insert_with(|| (Arc::clone(&block), num_workers));
+                    let footprint_bytes = block.memory_footprint();
+
+                    match inner.pinned_for_load.entry(pin_key) {
+                        Entry::Occupied(mut o) => {
+                            o.get_mut().1 += num_workers;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert((Arc::clone(&block), num_workers));
+                        }
+                    }
+
+                    match inner.pinned_for_load_by_key.entry(key) {
+                        Entry::Occupied(mut o) => {
+                            o.get_mut().1 += num_workers;
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert((footprint_bytes, num_workers));
+                            record_pin_unique_added(footprint_bytes);
+                        }
+                    }
                 }
             }
         }
@@ -851,8 +989,17 @@ impl StorageEngine {
         inner.prefetching.remove(&key);
 
         if let Some(block) = block {
-            if inner.cache.insert(key, block) {
-                core_metrics().cache_block_insertions.add(1, &[]);
+            let footprint_bytes = block.memory_footprint();
+            match inner.cache.insert(key, block) {
+                CacheInsertOutcome::InsertedNew => {
+                    record_cache_insert_new(footprint_bytes);
+                }
+                CacheInsertOutcome::AlreadyExists => {
+                    // No overwrite, no-op for metrics.
+                }
+                CacheInsertOutcome::Rejected => {
+                    core_metrics().cache_block_admission_rejections.add(1, &[]);
+                }
             }
         }
     }

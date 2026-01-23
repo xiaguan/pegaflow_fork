@@ -44,6 +44,10 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
   - Total pinned memory pool capacity in bytes
   - Use case: Derive pool utilization
 
+- **pegaflow_pool_largest_free_bytes** (Gauge)
+  - Largest contiguous free region in pinned pool (fragmentation signal)
+  - Use case: Distinguish true exhaustion vs fragmentation (largest_free << free_bytes)
+
 - **pegaflow_pool_alloc_failures_total** (Counter)
   - Total allocation failures after eviction retries
   - Use case: Detect memory exhaustion issues
@@ -64,6 +68,38 @@ PegaFlow exposes the following metrics for monitoring KV cache operations:
 - **pegaflow_cache_block_evictions_total** (Counter)
   - Blocks evicted from cache due to memory pressure
   - Use case: Monitor eviction frequency, tune pool size
+
+- **pegaflow_cache_block_evictions_still_referenced_total** (Counter)
+  - Evicted blocks that still had external references (eviction did not immediately reclaim pinned memory)
+  - Use case: Explain "evictions spike but pool_used_bytes doesn't drop"
+
+- **pegaflow_cache_eviction_reclaimed_bytes_total** (Counter)
+  - Estimated bytes actually reclaimed in pinned allocator after cache eviction
+  - Use case: Measure effectiveness of eviction under real reference patterns
+
+- **pegaflow_cache_resident_blocks** (Gauge)
+  - Current number of sealed blocks resident in cache
+  - Use case: Track cache size in blocks
+
+- **pegaflow_cache_resident_bytes** (Gauge)
+  - Current sealed block bytes resident in cache (sum of footprints)
+  - Use case: Attribute pinned pool usage to cache residency
+
+- **pegaflow_pinned_for_load_entries** (Gauge)
+  - Current number of pinned_for_load entries (instance_id, block_key)
+  - Use case: Diagnose load-path pins keeping evicted blocks alive
+
+- **pegaflow_pinned_for_load_refs** (Gauge)
+  - Current outstanding pinned_for_load consumer refcount (sum of per-entry counts)
+  - Use case: Detect stuck consumers / missing release on load path
+
+- **pegaflow_pinned_for_load_unique_blocks** (Gauge)
+  - Current number of unique blocks referenced by pinned_for_load
+  - Use case: Understand how many distinct blocks are being kept alive by pins
+
+- **pegaflow_pinned_for_load_unique_bytes** (Gauge)
+  - Current bytes referenced by pinned_for_load (unique blocks; sum of footprints)
+  - Use case: Attribute pinned pool usage to load-path pins
 
 ### Save Metrics (GPU → CPU)
 - **pegaflow_save_bytes_total** (Counter)

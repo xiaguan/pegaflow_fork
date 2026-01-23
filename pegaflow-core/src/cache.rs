@@ -30,6 +30,15 @@ pub(crate) struct TinyLfuCache<K, V> {
     freq: Option<TinyLfu>,
 }
 
+pub(crate) enum CacheInsertOutcome {
+    /// Key was not present and is now inserted.
+    InsertedNew,
+    /// Key already exists; candidate was ignored (no overwrite).
+    AlreadyExists,
+    /// Candidate was rejected by admission policy.
+    Rejected,
+}
+
 impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     pub fn new_unbounded(
         capacity_bytes: usize,
@@ -62,17 +71,16 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
     }
 
     /// Insert with TinyLFU admission. If the candidate is colder than the
-    /// current LRU victim it is dropped. Returns true if inserted.
-    pub fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> bool {
+    /// current LRU victim it is dropped.
+    pub fn insert(&mut self, key: BlockKey, value: ArcSealedBlock) -> CacheInsertOutcome {
         // Always record the access so future attempts have a chance.
         if let Some(freq) = &self.freq {
             freq.incr(&key);
         }
 
-        // Update existing entry eagerly.
+        // Key is content-addressed (hash); if it already exists, do not overwrite.
         if self.lru.contains_key(&key) {
-            self.lru.insert(key, value);
-            return true;
+            return CacheInsertOutcome::AlreadyExists;
         }
 
         if let Some(freq) = &self.freq {
@@ -80,13 +88,13 @@ impl TinyLfuCache<BlockKey, ArcSealedBlock> {
             if let Some((victim_key, _)) = self.lru.iter().next() {
                 let victim_freq = freq.get(victim_key);
                 if candidate_freq < victim_freq {
-                    return false;
+                    return CacheInsertOutcome::Rejected;
                 }
             }
         }
 
         self.lru.insert(key, value);
-        true
+        CacheInsertOutcome::InsertedNew
     }
 
     pub fn remove_lru(&mut self) -> Option<(BlockKey, ArcSealedBlock)> {

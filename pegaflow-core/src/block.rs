@@ -242,6 +242,11 @@ impl InflightBlock {
         self.total_slots
     }
 
+    /// Returns the current memory footprint of all inserted slots.
+    pub fn footprint(&self) -> u64 {
+        self.footprint
+    }
+
     pub fn slot_exists(&self, slot_id: usize) -> bool {
         self.slots
             .get(slot_id)

@@ -11,12 +11,118 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 200,
+      "title": "Memory",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": null },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "id": 201,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "pegaflow_pool_used_bytes",
+          "legendFormat": "pool_used (actual)",
+          "refId": "D"
+        },
+        {
+          "expr": "pegaflow_cache_resident_bytes",
+          "legendFormat": "cache_resident",
+          "refId": "A"
+        },
+        {
+          "expr": "pegaflow_inflight_bytes",
+          "legendFormat": "inflight",
+          "refId": "B"
+        },
+        {
+          "expr": "pegaflow_pinned_for_load_unique_bytes",
+          "legendFormat": "pinned_for_load (subset of cache)",
+          "refId": "C"
+        }
+      ],
+      "title": "Memory Accounting",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": null },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "capacity" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 202,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "pegaflow_pool_capacity_bytes",
+          "legendFormat": "capacity",
+          "refId": "A"
+        },
+        {
+          "expr": "pegaflow_pool_used_bytes",
+          "legendFormat": "used",
+          "refId": "B"
+        },
+        {
+          "expr": "pegaflow_pool_largest_free_bytes",
+          "legendFormat": "largest_free (fragmentation)",
+          "refId": "C"
+        }
+      ],
+      "title": "Pool Usage",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
       "id": 100,
       "title": "System Overview",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -32,7 +138,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
       "id": 1,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -54,7 +160,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -73,7 +179,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
       "id": 2,
       "options": {
         "reduceOptions": {
@@ -95,7 +201,7 @@
       "type": "gauge"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -111,7 +217,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
       "id": 3,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -139,55 +245,13 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
-      "id": 101,
-      "title": "Resource Utilization",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "stacking": { "group": "A", "mode": "none" }
-          },
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 10 },
-      "id": 4,
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
-      },
-      "targets": [
-        {
-          "expr": "pegaflow_pool_used_bytes / pegaflow_pool_capacity_bytes",
-          "legendFormat": "utilization",
-          "refId": "A"
-        }
-      ],
-      "title": "Pinned Pool Utilization",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
       "id": 102,
       "title": "Cache Operations",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -222,7 +286,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -260,7 +324,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -297,6 +361,11 @@
           "expr": "rate(pegaflow_cache_block_evictions_total[1m])",
           "legendFormat": "evictions",
           "refId": "C"
+        },
+        {
+          "expr": "rate(pegaflow_cache_block_evictions_still_referenced_total[1m])",
+          "legendFormat": "evictions (still referenced)",
+          "refId": "D"
         }
       ],
       "title": "Cache Insert / Evict Rate",
@@ -310,7 +379,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -343,7 +412,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -388,7 +457,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -426,7 +495,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -471,7 +540,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -504,7 +573,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -542,7 +611,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -580,7 +649,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -625,7 +694,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -663,7 +732,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -708,7 +777,7 @@
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -741,7 +810,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -774,7 +843,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -815,11 +884,11 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 80 },
       "id": 108,
-      "title": "Inflight / Leak Tracking",
+      "title": "Leak Tracking",
       "type": "row"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "datasource": { "type": "prometheus", "uid": null },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -831,24 +900,57 @@
             "pointSize": 4,
             "stacking": { "group": "A", "mode": "none" }
           },
-          "unit": "short"
+          "unit": "Bps"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 81 },
-      "id": 19,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 81 },
+      "id": 25,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
         "tooltip": { "mode": "single" }
       },
       "targets": [
         {
-          "expr": "pegaflow_inflight_blocks",
-          "legendFormat": "inflight blocks",
+          "expr": "rate(pegaflow_cache_eviction_reclaimed_bytes_total[1m])",
+          "legendFormat": "reclaimed bytes/sec",
           "refId": "A"
         }
       ],
-      "title": "Inflight Blocks (current)",
+      "title": "Cache Eviction Reclaimed Rate (1m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": null },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "stacking": { "group": "A", "mode": "none" }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 81 },
+      "id": 26,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "rate(pegaflow_inflight_gc_cleaned_total[1m])",
+          "legendFormat": "inflight gc cleaned/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Inflight GC Cleaned Rate",
       "type": "timeseries"
     }
   ],

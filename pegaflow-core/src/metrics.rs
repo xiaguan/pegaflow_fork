@@ -5,19 +5,30 @@ use opentelemetry::{
 use std::sync::OnceLock;
 
 pub(crate) struct CoreMetrics {
-    pub pool_used_bytes: UpDownCounter<i64>,
+    // Pinned pool (allocator-level)
     pub pool_capacity_bytes: UpDownCounter<i64>,
+    pub pool_used_bytes: UpDownCounter<i64>,
+    pub pool_largest_free_bytes: UpDownCounter<i64>,
     pub pool_alloc_failures: Counter<u64>,
 
-    pub inflight_blocks: UpDownCounter<i64>,
+    // Inflight (write path safety/health)
+    pub inflight_bytes: UpDownCounter<i64>,
     pub inflight_gc_cleaned: Counter<u64>,
 
+    // Cache (sealed blocks in memory)
+    pub cache_resident_bytes: UpDownCounter<i64>,
     pub cache_block_hits: Counter<u64>,
     pub cache_block_misses: Counter<u64>,
     pub cache_block_insertions: Counter<u64>,
     pub cache_block_admission_rejections: Counter<u64>,
     pub cache_block_evictions: Counter<u64>,
+    pub cache_block_evictions_still_referenced: Counter<u64>,
+    pub cache_eviction_reclaimed_bytes: Counter<u64>,
 
+    // Read-path pins (prevents eviction between prefix check and load)
+    pub pinned_for_load_unique_bytes: UpDownCounter<i64>,
+
+    // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
     pub save_duration_seconds: Histogram<f64>,
 
@@ -25,7 +36,7 @@ pub(crate) struct CoreMetrics {
     pub load_duration_seconds: Histogram<f64>,
     pub load_failures: Counter<u64>,
 
-    // SSD cache metrics
+    // SSD cache
     pub ssd_write_bytes: Counter<u64>,
     pub ssd_write_duration_seconds: Histogram<f64>,
     pub ssd_write_throughput_bytes_per_second: Histogram<f64>,
@@ -76,30 +87,44 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
         let meter = init_meter();
 
         CoreMetrics {
+            // Pool
+            pool_capacity_bytes: meter
+                .i64_up_down_counter("pegaflow_pool_capacity_bytes")
+                .with_unit("bytes")
+                .with_description("Total pinned pool capacity in bytes")
+                .build(),
             pool_used_bytes: meter
                 .i64_up_down_counter("pegaflow_pool_used_bytes")
                 .with_unit("bytes")
                 .with_description("Current pinned pool usage in bytes")
                 .build(),
-            pool_capacity_bytes: meter
-                .i64_up_down_counter("pegaflow_pool_capacity_bytes")
+            pool_largest_free_bytes: meter
+                .i64_up_down_counter("pegaflow_pool_largest_free_bytes")
                 .with_unit("bytes")
-                .with_description("Total pinned pool capacity in bytes")
+                .with_description("Largest contiguous free region in pinned pool (fragmentation signal)")
                 .build(),
             pool_alloc_failures: meter
                 .u64_counter("pegaflow_pool_alloc_failures")
                 .with_description("Pinned pool allocation failures after eviction retries")
                 .build(),
 
-            inflight_blocks: meter
-                .i64_up_down_counter("pegaflow_inflight_blocks")
-                .with_description("Current inflight (partial) blocks awaiting all slots")
+            // Inflight
+            inflight_bytes: meter
+                .i64_up_down_counter("pegaflow_inflight_bytes")
+                .with_unit("bytes")
+                .with_description("Current bytes in inflight blocks (memory allocated but not yet sealed)")
                 .build(),
             inflight_gc_cleaned: meter
                 .u64_counter("pegaflow_inflight_gc_cleaned")
                 .with_description("Stale inflight blocks cleaned by background GC")
                 .build(),
 
+            // Cache
+            cache_resident_bytes: meter
+                .i64_up_down_counter("pegaflow_cache_resident_bytes")
+                .with_unit("bytes")
+                .with_description("Current sealed block bytes resident in cache (sum of footprints)")
+                .build(),
             cache_block_hits: meter
                 .u64_counter("pegaflow_cache_block_hits")
                 .with_description("Complete blocks found in cache (cache hit)")
@@ -120,7 +145,24 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .u64_counter("pegaflow_cache_block_evictions")
                 .with_description("Blocks evicted from cache due to memory pressure")
                 .build(),
+            cache_block_evictions_still_referenced: meter
+                .u64_counter("pegaflow_cache_block_evictions_still_referenced")
+                .with_description("Evicted cache blocks that still had external references (eviction did not immediately reclaim memory)")
+                .build(),
+            cache_eviction_reclaimed_bytes: meter
+                .u64_counter("pegaflow_cache_eviction_reclaimed_bytes")
+                .with_unit("bytes")
+                .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
+                .build(),
 
+            // Pins
+            pinned_for_load_unique_bytes: meter
+                .i64_up_down_counter("pegaflow_pinned_for_load_unique_bytes")
+                .with_unit("bytes")
+                .with_description("Current bytes referenced by pinned_for_load (unique blocks; sum of footprints)")
+                .build(),
+
+            // Transfer
             save_bytes: meter
                 .u64_counter("pegaflow_save_bytes")
                 .with_unit("bytes")
@@ -149,6 +191,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_description("Load operation failures (e.g., transfer errors)")
                 .build(),
 
+            // SSD
             ssd_write_bytes: meter
                 .u64_counter("pegaflow_ssd_write_bytes")
                 .with_unit("bytes")
