@@ -690,6 +690,12 @@ impl StorageEngine {
                     if *total == 0 {
                         unique_bytes_to_remove = Some(*bytes);
                     }
+                } else {
+                    error!(
+                        "BUG: pinned_for_load_by_key missing key during unpin: namespace={} hash_len={}",
+                        key.namespace,
+                        key.hash.len()
+                    );
                 }
 
                 if let Some(bytes) = unique_bytes_to_remove {
