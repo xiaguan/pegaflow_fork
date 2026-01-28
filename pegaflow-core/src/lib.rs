@@ -1,7 +1,16 @@
+//! PegaFlow Core Engine
+//!
+//! A GPU-aware KV cache offloading engine with support for:
+//! - Multi-tenant instance isolation
+//! - Tensor parallelism (TP) across multiple GPUs
+//! - Split-storage layout for efficient K/V batch transfers
+//! - SSD caching tier
+
 pub mod allocator;
 pub mod block;
 mod cache;
 pub mod gpu_worker;
+pub mod instance;
 pub mod logging;
 mod metrics;
 pub mod pinned_mem;
@@ -16,6 +25,7 @@ mod uring;
 pub use block::{
     BlockHash, BlockInsertError, BlockKey, BlockStatus, LayerBlock, PrefetchStatus, SealedBlock,
 };
+pub use instance::{GpuContext, InstanceContext, KVCacheRegistration};
 pub use pinned_pool::PinnedAllocation;
 pub use seal_offload::SlotMeta;
 pub use ssd_cache::{
@@ -26,61 +36,56 @@ pub use storage::{SealNotification, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
-// PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
-// This means all K segments are contiguous, followed by all V segments, so the
-// GPU memory picture looks like:
+// KV Cache Layout Notes
+// ============================================================================
+//
+// PegaFlow currently prioritizes vLLM's layer-first (KV-first) tensor layout.
+// This means all K segments are contiguous, followed by all V segments:
 //
 //   +---------------------------------------------------------------+
 //   |  Layer0: KKKKKKKK.... | Layer0: VVVVVVVV.... | Layer1: K ...  |
 //   +---------------------------------------------------------------+
 //          ^ contiguous K blocks        ^ contiguous V blocks
 //
-// As long as vLLM keeps this layout we must respect its stride-based view and
-// fall back to strided transfers; future refactors can add dedicated handling
-// for other layouts without breaking this contract.
-//
-// To support efficient batching during "load" (CPU -> GPU), we now avoid
-// storing K and V interleaved in a single contiguous block. Instead, we allocate
-// all K segments for a saved batch in one contiguous CPU region, and all V segments
-// in another. This Split-Storage approach ensures that when we load the batch back,
-// the K source pointers are contiguous and can be merged into a single cuMemcpy,
-// significantly improving PCIe bandwidth utilization compared to strided copies.
+// To support efficient batching during "load" (CPU -> GPU), we avoid
+// interleaving K and V in a single contiguous block. Instead, we allocate
+// all K segments in one contiguous CPU region, and all V segments in another.
+// This Split-Storage approach allows merging K source pointers into a single
+// cuMemcpy, significantly improving PCIe bandwidth utilization.
 // ============================================================================
 
-use cudarc::driver::CudaContext;
-use log::{debug, info};
 use std::{
     collections::HashMap,
     fmt,
     num::NonZeroU64,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
 };
 
-use crate::gpu_worker::{GpuWorkerPool, LayerLoadData, LoadBlock, LoadTask, SaveBlock};
+use log::{debug, info};
+
+use crate::gpu_worker::{LayerLoadData, LoadBlock, LoadTask, SaveBlock};
 use crate::metrics::core_metrics;
 use crate::storage::{StorageEngine, SSD_ALIGNMENT};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 30GB
 
-/// Compute greatest common divisor using Euclidean algorithm
-fn gcd(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
+/// Errors that can occur during engine operations.
 #[derive(Debug)]
 pub enum EngineError {
+    /// Instance not found in the registry.
     InstanceMissing(String),
+    /// GPU worker not found for the specified device.
     WorkerMissing(String, i32),
+    /// Invalid argument provided.
     InvalidArgument(String),
+    /// CUDA initialization or runtime error.
     CudaInit(String),
+    /// Storage engine error.
     Storage(String),
+    /// Internal lock poisoned.
     Poisoned(&'static str),
-    TopologyMismatch(String), // Context, Details
+    /// Topology mismatch between registration and existing instance.
+    TopologyMismatch(String),
 }
 
 impl fmt::Display for EngineError {
@@ -107,192 +112,24 @@ impl From<LoadStateError> for EngineError {
     }
 }
 
+/// Main engine for managing KV cache offloading.
+///
+/// `PegaEngine` is the top-level orchestrator that:
+/// - Manages multiple inference instances
+/// - Coordinates GPU worker pools for async transfers
+/// - Interfaces with the storage engine for block caching
+///
+/// The engine is thread-safe and can be shared across async tasks.
 pub struct PegaEngine {
-    /// Manages instances and their GPU contexts
+    /// Active inference instances indexed by instance ID.
     instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
-    /// Storage engine responsible for pinned allocations + block cache + SSD index
+    /// Storage engine for pinned memory, block cache, and SSD tier.
     storage: Arc<StorageEngine>,
 }
 
-#[derive(Debug, Clone)]
-pub struct KVCacheRegistration {
-    pub data_ptr: u64,
-    pub size_bytes: usize,
-    pub num_blocks: usize,
-    pub bytes_per_block: usize,
-    pub block_size_bytes: usize,
-    /// Distance in bytes between K and V segments when KV-first layout is used.
-    /// Zero when the layout stores a single segment per block.
-    pub kv_stride_bytes: usize,
-    /// Number of segments per block (1 for blocks-first, 2 for KV-first).
-    pub segments: usize,
-}
-
-/// Context for a specific GPU (one CUDA device)
-struct GpuContext {
-    /// KV cache registrations for this GPU (Layer Name -> GPU Ptr Info)
-    kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
-    /// Hold CUDA context for the lifetime of the inference context
-    _cuda_ctx: Arc<CudaContext>,
-    /// Worker pool for async GPU operations (load/save)
-    worker_pool: GpuWorkerPool,
-}
-
-impl GpuContext {
-    fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Result<Self, EngineError> {
-        let worker_pool = GpuWorkerPool::spawn(device_id)?;
-        Ok(Self {
-            kv_caches: Mutex::new(HashMap::new()),
-            _cuda_ctx: cuda_ctx,
-            worker_pool,
-        })
-    }
-
-    fn register_layer(&self, layer_name: String, registration: KVCacheRegistration) {
-        let mut caches = self.kv_caches.lock().expect("kv_caches lock poisoned");
-        caches.insert(layer_name, registration);
-    }
-
-    fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
-        let caches = self.kv_caches.lock().expect("kv_caches lock poisoned");
-        caches.get(layer_name).cloned()
-    }
-
-    fn worker_pool(&self) -> &GpuWorkerPool {
-        &self.worker_pool
-    }
-}
-
-/// Global context for a Model Instance (across all device assignments)
-struct InstanceContext {
-    _id: String,
-    /// Namespace for model isolation (fixed for the instance lifetime)
-    namespace: String,
-    num_layers: usize,
-    tp_size: usize,
-    world_size: usize,
-    /// Maps layer name to layer ID (0..num_layers)
-    layer_name_to_id: Mutex<HashMap<String, usize>>,
-    /// Inverse map to ensure stable ordering
-    layer_names: Mutex<Vec<String>>,
-    /// Active GPU contexts for this instance, keyed by CUDA device ID
-    gpu_contexts: RwLock<HashMap<i32, Arc<GpuContext>>>,
-}
-
-impl InstanceContext {
-    fn new(
-        id: String,
-        namespace: String,
-        num_layers: usize,
-        tp_size: usize,
-        world_size: usize,
-    ) -> Self {
-        Self {
-            _id: id,
-            namespace,
-            num_layers,
-            tp_size,
-            world_size,
-            layer_name_to_id: Mutex::new(HashMap::new()),
-            layer_names: Mutex::new(Vec::new()),
-            gpu_contexts: RwLock::new(HashMap::new()),
-        }
-    }
-
-    fn get_or_create_layer_id(&self, layer_name: &str) -> usize {
-        let mut map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
-        if let Some(&id) = map.get(layer_name) {
-            return id;
-        }
-
-        let mut names = self.layer_names.lock().expect("layer_names lock poisoned");
-        let id = names.len();
-        names.push(layer_name.to_string());
-        map.insert(layer_name.to_string(), id);
-        id
-    }
-
-    fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let map = self
-            .layer_name_to_id
-            .lock()
-            .expect("layer_name_to_id lock poisoned");
-        map.get(layer_name).copied()
-    }
-
-    fn total_slots(&self) -> usize {
-        self.num_layers * self.tp_size
-    }
-
-    fn get_slot_index(&self, layer_id: usize, tp_rank: usize) -> Result<usize, EngineError> {
-        if layer_id >= self.num_layers {
-            return Err(EngineError::InvalidArgument(format!(
-                "layer_id {} out of range ({} layers)",
-                layer_id, self.num_layers
-            )));
-        }
-        if tp_rank >= self.tp_size {
-            return Err(EngineError::InvalidArgument(format!(
-                "tp_rank {} out of range (tp_size {})",
-                tp_rank, self.tp_size
-            )));
-        }
-        Ok(layer_id * self.tp_size + tp_rank)
-    }
-
-    fn ensure_gpu(&self, device_id: i32) -> Result<Arc<GpuContext>, EngineError> {
-        if device_id < 0 {
-            return Err(EngineError::InvalidArgument(format!(
-                "device_id {} must be >= 0",
-                device_id
-            )));
-        }
-
-        {
-            let workers = self
-                .gpu_contexts
-                .read()
-                .expect("gpu contexts read lock poisoned");
-            if let Some(worker) = workers.get(&device_id) {
-                return Ok(Arc::clone(worker));
-            }
-        }
-
-        let mut workers = self
-            .gpu_contexts
-            .write()
-            .expect("gpu contexts write lock poisoned");
-        if let Some(worker) = workers.get(&device_id) {
-            return Ok(Arc::clone(worker));
-        }
-
-        let cuda_ctx = CudaContext::new(device_id as usize)
-            .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
-        let worker = Arc::new(GpuContext::new(cuda_ctx, device_id)?);
-        workers.insert(device_id, Arc::clone(&worker));
-        Ok(worker)
-    }
-
-    fn get_gpu(&self, device_id: i32) -> Option<Arc<GpuContext>> {
-        let workers = self
-            .gpu_contexts
-            .read()
-            .expect("gpu contexts read lock poisoned");
-        workers.get(&device_id).cloned()
-    }
-}
-
-impl Default for PegaEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[allow(clippy::new_without_default)]
 impl PegaEngine {
-    /// Create a new PegaEngine instance with default pool size and regular pages
+    /// Create a new engine with default 30GB pinned memory pool.
     pub fn new() -> Self {
         let (engine, _rx) = Self::new_with_config(
             DEFAULT_PINNED_POOL_BYTES,
@@ -302,19 +139,18 @@ impl PegaEngine {
         engine
     }
 
-    /// Create a new PegaEngine instance with a custom pinned memory pool size
+    /// Create an engine with a custom pinned memory pool size.
     ///
-    /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
+    /// Set `use_hugepages` to true for 2MB huge pages (requires system configuration).
     pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
         let (engine, _rx) =
             Self::new_with_config(pool_size, use_hugepages, storage::StorageConfig::default());
         engine
     }
 
-    /// Create a new PegaEngine instance with custom pool size and storage config
+    /// Create an engine with full custom configuration.
     ///
-    /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
-    /// Returns (engine, seal_notify_rx) - pass receiver to `spawn_seal_offload_task` for SSD offload.
+    /// Returns the engine and a receiver for seal notifications (used for SSD offload).
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
@@ -322,6 +158,7 @@ impl PegaEngine {
     ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SealNotification>) {
         let (storage, seal_notify_rx) =
             StorageEngine::new_with_config(pool_size, use_hugepages, storage_config);
+
         (
             PegaEngine {
                 instances: RwLock::new(HashMap::new()),
@@ -331,6 +168,10 @@ impl PegaEngine {
         )
     }
 
+    /// Get or create an instance with the specified topology.
+    ///
+    /// If an instance with the same ID exists but different topology,
+    /// returns a `TopologyMismatch` error.
     fn get_or_create_instance(
         &self,
         instance_id: &str,
@@ -339,53 +180,37 @@ impl PegaEngine {
         tp_size: usize,
         world_size: usize,
     ) -> Result<Arc<InstanceContext>, EngineError> {
-        // Fast path
-        {
-            let instances = self.instances.read().expect("instances read lock poisoned");
-            if let Some(instance) = instances.get(instance_id) {
-                // Verify topology matches
-                if instance.num_layers != num_layers
-                    || instance.tp_size != tp_size
-                    || instance.world_size != world_size
-                {
-                    return Err(EngineError::TopologyMismatch(format!(
-                        "instance {instance_id} exists with layers={}, tp={}, world={}; requested layers={}, tp={}, world={}",
-                        instance.num_layers, instance.tp_size, instance.world_size, num_layers, tp_size, world_size
-                    )));
-                }
-                return Ok(Arc::clone(instance));
-            }
-        }
-
-        // Slow path
         let mut instances = self
             .instances
             .write()
             .expect("instances write lock poisoned");
+
         if let Some(instance) = instances.get(instance_id) {
-            if instance.num_layers != num_layers
-                || instance.tp_size != tp_size
-                || instance.world_size != world_size
-            {
-                return Err(EngineError::TopologyMismatch(format!(
-                    "instance {instance_id} exists with layers={}, tp={}, world={}; requested layers={}, tp={}, world={}",
-                    instance.num_layers, instance.tp_size, instance.world_size, num_layers, tp_size, world_size
-                )));
-            }
+            // Already exists, verify topology
+            instance
+                .verify_topology(num_layers, tp_size, world_size)
+                .map_err(|e| {
+                    EngineError::TopologyMismatch(format!("instance {instance_id} {e}"))
+                })?;
             return Ok(Arc::clone(instance));
         }
 
-        let instance = Arc::new(InstanceContext::new(
+        // Create new instance
+        let instance = InstanceContext::new(
             instance_id.to_string(),
             namespace.to_string(),
             num_layers,
             tp_size,
             world_size,
-        ));
+        )
+        .map_err(EngineError::InvalidArgument)?;
+
+        let instance = Arc::new(instance);
         instances.insert(instance_id.to_string(), Arc::clone(&instance));
         Ok(instance)
     }
 
+    /// Look up an instance by ID.
     fn get_instance(&self, instance_id: &str) -> Result<Arc<InstanceContext>, EngineError> {
         let instances = self.instances.read().expect("instances read lock poisoned");
         instances
@@ -394,7 +219,10 @@ impl PegaEngine {
             .ok_or_else(|| EngineError::InstanceMissing(instance_id.to_string()))
     }
 
-    /// Register a KV cache region with its layout info
+    /// Register a KV cache layer with its memory layout.
+    ///
+    /// This validates the layout parameters, initializes the instance/GPU context
+    /// if needed, and stores the registration for subsequent load/save operations.
     #[allow(clippy::too_many_arguments)]
     pub fn register_context_layer(
         &self,
@@ -413,114 +241,47 @@ impl PegaEngine {
         world_size: usize,
         num_layers: usize,
     ) -> Result<(), EngineError> {
-        if bytes_per_block == 0 || num_blocks == 0 || segments == 0 {
-            return Err(EngineError::InvalidArgument(format!(
-                "invalid KV cache layout for layer {layer_name}"
-            )));
-        }
-        if segments > 1 && kv_stride_bytes == 0 {
-            return Err(EngineError::InvalidArgument(format!(
-                "kv_stride_bytes must be > 0 when segments > 1 for layer {layer_name}"
-            )));
-        }
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(
                 "device_id must be >= 0".to_string(),
             ));
         }
 
-        // Validate block sizing/strides up front to avoid runtime overflows
-        let block_size_bytes = bytes_per_block.checked_mul(segments).ok_or_else(|| {
-            EngineError::InvalidArgument(format!(
-                "block size overflow: bytes_per_block={} segments={} for layer {layer_name}",
-                bytes_per_block, segments
-            ))
-        })?;
-
-        // Compute maximum offset + block size for the last segment of the last block
-        let max_block_offset = num_blocks
-            .checked_sub(1)
-            .and_then(|idx| idx.checked_mul(bytes_per_block))
-            .ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "num_blocks {} too large for layer {layer_name}",
-                    num_blocks
-                ))
-            })?;
-        let max_segment_offset = segments
-            .checked_sub(1)
-            .and_then(|idx| idx.checked_mul(kv_stride_bytes))
-            .ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "segments/stride overflow for layer {layer_name} (segments={}, stride={})",
-                    segments, kv_stride_bytes
-                ))
-            })?;
-
-        let max_offset = max_block_offset
-            .checked_add(max_segment_offset)
-            .ok_or_else(|| {
-                EngineError::InvalidArgument(format!(
-                    "layout offset overflow for layer {layer_name}"
-                ))
-            })?;
-        let end = max_offset.checked_add(bytes_per_block).ok_or_else(|| {
-            EngineError::InvalidArgument(format!("layout end overflow for layer {layer_name}"))
-        })?;
-        if end > size_bytes {
-            return Err(EngineError::InvalidArgument(format!(
-                "registered memory too small for layer {layer_name}: need at least {} bytes, got {}",
-                end,
-                size_bytes
-            )));
-        }
-
-        let instance =
-            self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
-        let worker = instance.ensure_gpu(device_id)?;
-
-        // Register layer ID in global instance map
-        instance.get_or_create_layer_id(&layer_name);
-
-        if self.storage.is_ssd_enabled() && !bytes_per_block.is_multiple_of(SSD_ALIGNMENT) {
-            let gcd = gcd(bytes_per_block, SSD_ALIGNMENT);
-            let aligned_factor = SSD_ALIGNMENT / gcd;
-            return Err(EngineError::InvalidArgument(format!(
-                "SSD cache requires bytes_per_block to be aligned to {} bytes, but got {} for layer {}. \
-                 Hint: bytes_per_block = stride * block_size. Current block_size likely needs to be multiplied by {} \
-                 to achieve alignment. Consider using block_size that is a multiple of {}.",
-                SSD_ALIGNMENT, bytes_per_block, layer_name, aligned_factor, aligned_factor
-            )));
-        }
-
-        let registration = KVCacheRegistration {
+        // Construct and validate registration
+        let registration = KVCacheRegistration::new(
             data_ptr,
             size_bytes,
             num_blocks,
             bytes_per_block,
-            block_size_bytes,
             kv_stride_bytes,
             segments,
-        };
+        )
+        .map_err(|e| EngineError::InvalidArgument(format!("layer {layer_name}: {e}")))?;
 
-        worker.register_layer(layer_name.clone(), registration);
+        // SSD alignment check
+        if self.storage.is_ssd_enabled() {
+            if let Some(msg) = registration.check_ssd_alignment(SSD_ALIGNMENT) {
+                return Err(EngineError::InvalidArgument(format!(
+                    "layer {layer_name}: {msg}"
+                )));
+            }
+        }
+
+        // Get or create instance, then register new layer on GPU
+        let instance =
+            self.get_or_create_instance(instance_id, namespace, num_layers, tp_size, world_size)?;
+
+        instance.register_new_gpu_layer(device_id, &layer_name, registration)?;
+
         info!(
-            "Registered context: instance={}, namespace={}, device={}, layer={}, \
-             num_blocks={}, bytes_per_block={}, segments={}, tp_rank={}/{}",
-            instance_id,
-            namespace,
-            device_id,
-            layer_name,
-            num_blocks,
-            bytes_per_block,
-            segments,
-            tp_rank,
-            tp_size
+            "Registered context: instance={instance_id}, namespace={namespace}, \
+             device={device_id}, layer={layer_name}, num_blocks={num_blocks}, \
+             bytes_per_block={bytes_per_block}, segments={segments}, tp_rank={tp_rank}/{tp_size}"
         );
         Ok(())
     }
 
-    /// Unregister instance
+    /// Unregister an instance and release all associated resources.
     pub fn unregister_instance(&self, instance_id: &str) -> Result<(), EngineError> {
         let removed = self
             .instances
@@ -537,9 +298,8 @@ impl PegaEngine {
 
     /// Batch save KV blocks from multiple layers.
     ///
-    /// Each element in `saves` is a tuple of (layer_name, block_ids, block_hashes).
-    /// This is more efficient than calling save_kv_blocks_from_ipc in a loop
-    /// as it reduces Python-Rust boundary crossings.
+    /// More efficient than calling `save_kv_blocks_from_ipc` in a loop as it
+    /// reduces Python-Rust boundary crossings.
     pub async fn batch_save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
@@ -548,7 +308,7 @@ impl PegaEngine {
         saves: Vec<(String, Vec<i32>, Vec<Vec<u8>>)>,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = instance.namespace.clone();
+        let namespace = instance.namespace().to_string();
 
         for (layer_name, block_ids, block_hashes) in saves {
             self.save_kv_blocks_from_ipc_inner(
@@ -565,6 +325,7 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Save KV blocks for a single layer.
     pub async fn save_kv_blocks_from_ipc(
         &self,
         instance_id: &str,
@@ -575,13 +336,13 @@ impl PegaEngine {
         block_hashes: Vec<Vec<u8>>,
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = &instance.namespace;
+        let namespace = instance.namespace().to_string();
 
         self.save_kv_blocks_from_ipc_inner(
             instance_id,
             tp_rank,
             device_id,
-            namespace,
+            &namespace,
             layer_name,
             block_ids,
             block_hashes,
@@ -589,6 +350,7 @@ impl PegaEngine {
         .await
     }
 
+    /// Internal implementation for saving KV blocks.
     #[allow(clippy::too_many_arguments)]
     async fn save_kv_blocks_from_ipc_inner(
         &self,
@@ -612,7 +374,7 @@ impl PegaEngine {
         let timer = std::time::Instant::now();
 
         let instance = self.get_instance(instance_id)?;
-        let worker = instance
+        let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
@@ -620,34 +382,33 @@ impl PegaEngine {
             .get_layer_id(layer_name)
             .ok_or_else(|| EngineError::InvalidArgument(format!("layer {layer_name} unknown")))?;
 
-        let registration = worker.get_registration(layer_name).ok_or_else(|| {
+        let registration = gpu.get_registration(layer_name).ok_or_else(|| {
             EngineError::InvalidArgument(format!("layer {layer_name} not registered on device"))
         })?;
 
         let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
         let total_slots = instance.total_slots();
 
-        // Validate block_ids and collect block_hashes for filtering
-        let mut valid_blocks: Vec<(usize, Vec<u8>)> = Vec::with_capacity(block_ids.len());
-        for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
-            if *block_id < 0 {
-                continue;
-            }
-            let block_idx = *block_id as usize;
-            if block_idx >= registration.num_blocks {
-                return Err(EngineError::InvalidArgument(format!(
-                    "block {block_idx} out of range for layer {layer_name} ({} blocks registered)",
-                    registration.num_blocks
-                )));
-            }
-            valid_blocks.push((block_idx, block_hash.clone()));
-        }
+        // Filter valid blocks
+        let valid_blocks: Vec<(usize, Vec<u8>)> = block_ids
+            .iter()
+            .zip(block_hashes.iter())
+            .filter(|(id, _)| **id >= 0)
+            .filter_map(|(id, hash)| {
+                let idx = *id as usize;
+                if idx < registration.num_blocks {
+                    Some((idx, hash.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if valid_blocks.is_empty() {
             return Ok(());
         }
 
-        // Filter blocks that need saving (single lock acquisition)
+        // Filter out blocks that already exist
         let valid_hashes: Vec<Vec<u8>> = valid_blocks.iter().map(|(_, h)| h.clone()).collect();
         let indices_to_save = self
             .storage
@@ -657,7 +418,6 @@ impl PegaEngine {
             return Ok(());
         }
 
-        // Collect only blocks that need saving
         let blocks_to_save: Vec<(usize, Vec<u8>)> = indices_to_save
             .into_iter()
             .map(|i| valid_blocks[i].clone())
@@ -671,174 +431,38 @@ impl PegaEngine {
         let block_size = registration.block_size_bytes;
         let num_blocks = blocks_to_save.len();
 
-        // For layer-first layout with KV stride, allocate separate regions for K and V
+        // Handle split K/V layout
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
         {
-            let segment_size = registration.bytes_per_block;
-            let k_total_size = (segment_size as u64)
-                .checked_mul(num_blocks as u64)
-                .and_then(NonZeroU64::new)
-                .expect("allocation size overflow for K segments in layer {layer_name}");
-            let v_total_size = k_total_size;
-
-            // Allocate separate regions for K and V segments
-            let mut k_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
-                EngineError::Storage(
-                    "pinned pool exhausted while allocating K segment buffer".to_string(),
-                )
-            })?;
-
-            let mut v_allocation = self.storage.allocate(v_total_size).ok_or_else(|| {
-                EngineError::Storage(
-                    "pinned pool exhausted while allocating V segment buffer".to_string(),
-                )
-            })?;
-
-            // Get mutable pointers before creating Arc clones
-            // Store as usize to cross await point (pinned memory won't move)
-            let (k_base_addr, v_base_addr) = {
-                let k_ptr = Arc::get_mut(&mut k_allocation)
-                    .expect("k_allocation must be uniquely owned here")
-                    .as_mut_ptr();
-                let v_ptr = Arc::get_mut(&mut v_allocation)
-                    .expect("v_allocation must be uniquely owned here")
-                    .as_mut_ptr();
-                (k_ptr as usize, v_ptr as usize)
-            };
-
-            // Build SaveBlock list for worker
-            let save_blocks: Vec<SaveBlock> = blocks_to_save
-                .iter()
-                .enumerate()
-                .map(|(i, (block_idx, _))| SaveBlock {
-                    block_idx: *block_idx,
-                    k_dst_ptr: (k_base_addr + i * segment_size) as *mut u8,
-                    v_dst_ptr: Some((v_base_addr + i * segment_size) as *mut u8),
-                })
-                .collect();
-
-            // Execute GPU->CPU copy via worker pool
-            worker
-                .worker_pool()
-                .save(registration.clone(), save_blocks)
-                .await?;
-
-            // Create LayerBlock objects after copying is done
-            let mut sealed_blocks = Vec::new();
-            for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
-                let k_ptr = (k_base_addr + i * segment_size) as *mut u8;
-                let v_ptr = (v_base_addr + i * segment_size) as *mut u8;
-
-                let block = Arc::new(LayerBlock::new_split(
-                    k_ptr,
-                    v_ptr,
-                    block_size,
-                    Arc::clone(&k_allocation),
-                    Arc::clone(&v_allocation),
-                ));
-
-                if let Some(sealed) = self
-                    .storage
-                    .insert_slot(namespace, block_hash, slot_id, block, total_slots)
-                    .map_err(|e| EngineError::Storage(e.to_string()))?
-                {
-                    sealed_blocks.push(sealed);
-                }
-            }
-
-            self.storage.send_ssd_batch(&sealed_blocks);
-
-            // Batch admit with prefix-aware early break:
-            // If block[i] is rejected, block[i+1..] are useless for prefix matching
-            for (key, block) in sealed_blocks {
-                if !self.storage.cache_admit(key, block) {
-                    break;
-                }
-            }
+            self.save_split_blocks(
+                namespace,
+                &registration,
+                &blocks_to_save,
+                block_size,
+                slot_id,
+                total_slots,
+                gpu,
+            )
+            .await?;
         } else {
-            // Contiguous or single-segment layouts
-            let block_size_u64 = u64::try_from(block_size).map_err(|_| {
-                EngineError::Storage(format!(
-                    "block size {} exceeds supported range for layer {layer_name}",
-                    block_size
-                ))
-            })?;
-            let total_size = block_size_u64
-                .checked_mul(num_blocks as u64)
-                .and_then(NonZeroU64::new)
-                .ok_or_else(|| {
-                    EngineError::Storage(format!(
-                        "allocation size overflow while saving layer {layer_name}"
-                    ))
-                })?;
-
-            let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
-                EngineError::Storage(
-                    "pinned pool exhausted while allocating contiguous block buffer".to_string(),
-                )
-            })?;
-
-            // Store as usize to cross await point (pinned memory won't move)
-            let base_addr = Arc::get_mut(&mut allocation)
-                .ok_or_else(|| {
-                    EngineError::Storage(format!(
-                        "allocation shared unexpectedly while saving layer {layer_name}"
-                    ))
-                })?
-                .as_mut_ptr() as usize;
-
-            // Build SaveBlock list for worker
-            let save_blocks: Vec<SaveBlock> = blocks_to_save
-                .iter()
-                .enumerate()
-                .map(|(i, (block_idx, _))| SaveBlock {
-                    block_idx: *block_idx,
-                    k_dst_ptr: (base_addr + i * block_size) as *mut u8,
-                    v_dst_ptr: None,
-                })
-                .collect();
-
-            // Execute GPU->CPU copy via worker pool
-            worker
-                .worker_pool()
-                .save(registration.clone(), save_blocks)
-                .await?;
-
-            // Create LayerBlock objects after copying is done
-            let mut sealed_blocks = Vec::new();
-            for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
-                let cpu_ptr = (base_addr + i * block_size) as *mut u8;
-
-                let block = Arc::new(LayerBlock::new_contiguous(
-                    cpu_ptr,
-                    block_size,
-                    Arc::clone(&allocation),
-                ));
-
-                if let Some(sealed) = self
-                    .storage
-                    .insert_slot(namespace, block_hash, slot_id, block, total_slots)
-                    .map_err(|e| EngineError::Storage(e.to_string()))?
-                {
-                    sealed_blocks.push(sealed);
-                }
-            }
-
-            self.storage.send_ssd_batch(&sealed_blocks);
-
-            // Batch admit with prefix-aware early break:
-            // If block[i] is rejected, block[i+1..] are useless for prefix matching
-            for (key, block) in sealed_blocks {
-                if !self.storage.cache_admit(key, block) {
-                    break;
-                }
-            }
+            // Contiguous layout
+            self.save_contiguous_blocks(
+                namespace,
+                &registration,
+                &blocks_to_save,
+                block_size,
+                slot_id,
+                total_slots,
+                gpu,
+            )
+            .await?;
         }
 
         let elapsed = timer.elapsed().as_secs_f64();
         let total_bytes = (block_size as u64)
             .checked_mul(num_blocks as u64)
             .unwrap_or(0);
+
         if num_blocks > 0 {
             metrics.save_bytes.add(total_bytes, &[]);
             metrics.save_duration_seconds.record(elapsed, &[]);
@@ -846,27 +470,192 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Save blocks with split K/V storage layout.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_split_blocks(
+        &self,
+        namespace: &str,
+        registration: &KVCacheRegistration,
+        blocks_to_save: &[(usize, Vec<u8>)],
+        block_size: usize,
+        slot_id: usize,
+        total_slots: usize,
+        gpu: Arc<GpuContext>,
+    ) -> Result<(), EngineError> {
+        let segment_size = registration.bytes_per_block;
+        let num_blocks = blocks_to_save.len();
+
+        // Allocate separate regions for K and V
+        let k_total_size = (segment_size as u64)
+            .checked_mul(num_blocks as u64)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| {
+                EngineError::Storage("allocation size overflow for K segments".to_string())
+            })?;
+
+        let mut k_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
+            EngineError::Storage(
+                "pinned pool exhausted while allocating K segment buffer".to_string(),
+            )
+        })?;
+
+        let mut v_allocation = self.storage.allocate(k_total_size).ok_or_else(|| {
+            EngineError::Storage(
+                "pinned pool exhausted while allocating V segment buffer".to_string(),
+            )
+        })?;
+
+        // Get base pointers
+        let (k_base, v_base) = {
+            let k_ptr = Arc::get_mut(&mut k_allocation)
+                .expect("k_allocation must be uniquely owned")
+                .as_mut_ptr();
+            let v_ptr = Arc::get_mut(&mut v_allocation)
+                .expect("v_allocation must be uniquely owned")
+                .as_mut_ptr();
+            (k_ptr as usize, v_ptr as usize)
+        };
+
+        // Build save blocks
+        let save_blocks: Vec<SaveBlock> = blocks_to_save
+            .iter()
+            .enumerate()
+            .map(|(i, (block_idx, _))| SaveBlock {
+                block_idx: *block_idx,
+                k_dst_ptr: (k_base + i * segment_size) as *mut u8,
+                v_dst_ptr: Some((v_base + i * segment_size) as *mut u8),
+            })
+            .collect();
+
+        // Execute GPU->CPU copy
+        gpu.worker_pool()
+            .save(registration.clone(), save_blocks)
+            .await?;
+
+        // Create sealed blocks and admit to cache
+        let mut sealed_blocks = Vec::new();
+        for (i, (_, block_hash)) in blocks_to_save.iter().enumerate() {
+            let k_ptr = (k_base + i * segment_size) as *mut u8;
+            let v_ptr = (v_base + i * segment_size) as *mut u8;
+
+            let block = Arc::new(LayerBlock::new_split(
+                k_ptr,
+                v_ptr,
+                block_size,
+                Arc::clone(&k_allocation),
+                Arc::clone(&v_allocation),
+            ));
+
+            if let Some(sealed) = self
+                .storage
+                .insert_slot(namespace, block_hash.clone(), slot_id, block, total_slots)
+                .map_err(|e| EngineError::Storage(e.to_string()))?
+            {
+                sealed_blocks.push(sealed);
+            }
+        }
+
+        self.storage.send_ssd_batch(&sealed_blocks);
+
+        // Admit to cache (prefix-aware: stop on first rejection)
+        for (key, block) in sealed_blocks {
+            if !self.storage.cache_admit(key, block) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save blocks with contiguous storage layout.
+    #[allow(clippy::too_many_arguments)]
+    async fn save_contiguous_blocks(
+        &self,
+        namespace: &str,
+        registration: &KVCacheRegistration,
+        blocks_to_save: &[(usize, Vec<u8>)],
+        block_size: usize,
+        slot_id: usize,
+        total_slots: usize,
+        gpu: Arc<GpuContext>,
+    ) -> Result<(), EngineError> {
+        let num_blocks = blocks_to_save.len();
+
+        let total_size = (block_size as u64)
+            .checked_mul(num_blocks as u64)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| EngineError::Storage("allocation size overflow".to_string()))?;
+
+        let mut allocation = self.storage.allocate(total_size).ok_or_else(|| {
+            EngineError::Storage(
+                "pinned pool exhausted while allocating contiguous block buffer".to_string(),
+            )
+        })?;
+
+        let base_addr = Arc::get_mut(&mut allocation)
+            .ok_or_else(|| EngineError::Storage("allocation shared unexpectedly".to_string()))?
+            .as_mut_ptr() as usize;
+
+        let save_blocks: Vec<SaveBlock> = blocks_to_save
+            .iter()
+            .enumerate()
+            .map(|(i, (block_idx, _))| SaveBlock {
+                block_idx: *block_idx,
+                k_dst_ptr: (base_addr + i * block_size) as *mut u8,
+                v_dst_ptr: None,
+            })
+            .collect();
+
+        gpu.worker_pool()
+            .save(registration.clone(), save_blocks)
+            .await?;
+
+        let mut sealed_blocks = Vec::new();
+        for (i, (_, block_hash)) in blocks_to_save.iter().enumerate() {
+            let cpu_ptr = (base_addr + i * block_size) as *mut u8;
+
+            let block = Arc::new(LayerBlock::new_contiguous(
+                cpu_ptr,
+                block_size,
+                Arc::clone(&allocation),
+            ));
+
+            if let Some(sealed) = self
+                .storage
+                .insert_slot(namespace, block_hash.clone(), slot_id, block, total_slots)
+                .map_err(|e| EngineError::Storage(e.to_string()))?
+            {
+                sealed_blocks.push(sealed);
+            }
+        }
+
+        self.storage.send_ssd_batch(&sealed_blocks);
+
+        for (key, block) in sealed_blocks {
+            if !self.storage.cache_admit(key, block) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Count prefix hit blocks with SSD prefetch support.
     ///
     /// Returns:
-    /// - `Done { hit, missing: 0 }`: all requested blocks are in memory cache
+    /// - `Done { hit, missing: 0 }`: all blocks in memory cache
     /// - `Loading { hit, loading }`: some blocks being fetched from SSD
-    /// - `Done { hit, missing }`: some blocks don't exist anywhere
-    ///
-    /// When a cache miss is detected but SSD cache has the block, this method automatically
-    /// starts a background prefetch from SSD. The caller should retry after a short delay.
+    /// - `Done { hit, missing }`: some blocks don't exist
     pub fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<PrefetchStatus, EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = &instance.namespace;
-        let world_size = instance.world_size;
+        let namespace = instance.namespace();
+        let world_size = instance.world_size();
         let metrics = core_metrics();
 
-        // Delegate to storage engine's unified check_prefix_and_prefetch
-        // Pass world_size as num_workers so each worker (TP*PP*PCP) can consume the pin once
         let status = self.storage.check_prefix_and_prefetch(
             instance_id,
             namespace,
@@ -874,7 +663,6 @@ impl PegaEngine {
             world_size,
         );
 
-        // Record metrics for terminal state
         match &status {
             PrefetchStatus::Done { hit, missing } => {
                 metrics.cache_block_hits.add(*hit as u64, &[]);
@@ -891,34 +679,29 @@ impl PegaEngine {
     }
 
     /// Unpin blocks that were pinned during query.
-    /// This is used when load is cancelled or preempted before consumption.
-    /// Returns the number of blocks that were successfully unpinned.
+    ///
+    /// Used when load is cancelled or preempted before consumption.
     pub fn unpin_blocks(
         &self,
         instance_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<usize, EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = &instance.namespace;
+        let namespace = instance.namespace();
         let unpinned = self
             .storage
             .unpin_blocks(instance_id, namespace, block_hashes);
         debug!(
-            "unpin_blocks: instance_id={} blocks={} unpinned={}",
-            instance_id,
-            block_hashes.len(),
-            unpinned
+            "unpin_blocks: instance_id={instance_id} blocks={} unpinned={unpinned}",
+            block_hashes.len()
         );
         Ok(unpinned)
     }
 
     /// Batch load KV blocks for multiple layers asynchronously.
     ///
-    /// This submits a task to the GPU worker pool which performs all transfers.
-    /// The function returns immediately after submitting the task.
-    ///
-    /// The connector creates a LoadState, passes the `load_state_shm` to this method,
-    /// and then spin-waits on the state until it becomes non-zero (1=success, -1=error).
+    /// Returns immediately after submitting the task to the GPU worker pool.
+    /// The connector spin-waits on the `LoadState` until completion.
     #[allow(clippy::too_many_arguments)]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,
@@ -930,7 +713,6 @@ impl PegaEngine {
         block_ids: &[i32],
         block_hashes: &[Vec<u8>],
     ) -> Result<(), EngineError> {
-        // Attach to LoadState early so we can set error if something fails
         let load_state = LoadState::attach(load_state_shm)?;
 
         let result = self.batch_load_kv_blocks_multi_layer_inner(
@@ -943,12 +725,8 @@ impl PegaEngine {
             block_hashes,
         );
 
-        // If we failed before submitting to worker, set error on LoadState
         if let Err(ref e) = result {
-            log::error!(
-                "batch_load_kv_blocks_multi_layer failed before worker: error={:?}",
-                e
-            );
+            log::error!("batch_load_kv_blocks_multi_layer pre-submit error: {e:?}");
             load_state.set_error();
         }
 
@@ -967,19 +745,19 @@ impl PegaEngine {
         block_hashes: &[Vec<u8>],
     ) -> Result<(), EngineError> {
         let instance = self.get_instance(instance_id)?;
-        let namespace = &instance.namespace;
+        let namespace = instance.namespace();
 
-        let worker = instance
+        let gpu = instance
             .get_gpu(device_id)
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
-        // Lookup all block_hashes ONCE (consumes pinned blocks, falls back to cache)
+        // Lookup all blocks (consumes pinned blocks)
         let block_cache = self
             .storage
             .cache_lookup_many(instance_id, namespace, block_hashes)
             .map_err(EngineError::Storage)?;
 
-        // Build LoadTask with data for all layers
+        // Build load tasks for each layer
         let mut layers = Vec::with_capacity(layer_names.len());
 
         for layer_name in layer_names {
@@ -989,7 +767,7 @@ impl PegaEngine {
                 ))
             })?;
 
-            let registration = worker.get_registration(layer_name).ok_or_else(|| {
+            let registration = gpu.get_registration(layer_name).ok_or_else(|| {
                 EngineError::InvalidArgument(format!(
                     "layer {layer_name} not registered on device {device_id}"
                 ))
@@ -997,7 +775,6 @@ impl PegaEngine {
 
             let slot_id = instance.get_slot_index(layer_id, tp_rank)?;
 
-            // Collect valid blocks to load for this layer
             let blocks: Vec<LoadBlock> = block_ids
                 .iter()
                 .zip(block_cache.iter())
@@ -1020,29 +797,23 @@ impl PegaEngine {
             }
         }
 
-        // If no layers have blocks to load, complete immediately
+        // Complete immediately if no blocks to load
         if layers.is_empty() {
             debug!("No blocks to load, completing immediately");
-            let load_state = LoadState::attach(load_state_shm)?;
-            load_state.set_completed();
+            LoadState::attach(load_state_shm)?.set_completed();
             return Ok(());
         }
 
-        // Submit task to worker pool (fire and forget)
-        let task = LoadTask {
+        // Submit to worker pool (fire and forget)
+        gpu.worker_pool().submit_load(LoadTask {
             layers,
             load_state_shm: load_state_shm.to_string(),
-        };
-
-        worker.worker_pool().submit_load(task)
+        })
     }
 
-    /// Remove stale inflight blocks that have been stuck for longer than `max_age`.
+    /// Remove stale inflight blocks (background GC).
     ///
-    /// This is a background GC operation to clean up orphan inflight blocks caused
-    /// by rare race conditions. Should be called periodically (e.g., every 5 minutes).
-    ///
-    /// Returns the number of cleaned blocks.
+    /// Should be called periodically (e.g., every 5 minutes).
     pub fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
         self.storage.gc_stale_inflight(max_age)
     }
