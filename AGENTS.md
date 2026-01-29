@@ -119,6 +119,7 @@ cargo test -p pegaflow-server utils::tests::test_parse_memory_size_basic
 
 - `pegaflow-core/src/lib.rs`: Main PegaEngine implementation
 - `pegaflow-core/src/storage.rs`: Block storage engine
+- `pegaflow-core/src/numa.rs`: NUMA topology detection and GPU affinity queries
 - `pegaflow-server/src/service.rs`: gRPC service implementation
 - `python/src/lib.rs`: PyO3 bindings (Rust side)
 - `python/pegaflow/pegaflow.pyi`: Type stubs for PyO3 bindings
