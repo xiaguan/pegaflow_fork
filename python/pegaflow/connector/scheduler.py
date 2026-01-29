@@ -10,9 +10,11 @@ from pegaflow.connector.common import (
     ConnectorContext,
     LoadIntent,
     PegaConnectorMetadata,
+    PegaKVConnectorStats,
     SaveIntent,
     logger,
 )
+from pegaflow.connector.connector_metrics import PrefetchTracker
 from pegaflow.pegaflow import PegaFlowBusinessError, PegaFlowServiceError
 
 if TYPE_CHECKING:
@@ -31,6 +33,9 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
+
+        # Prefetch tracking (for metrics)
+        self._prefetch_tracker = PrefetchTracker()
 
         # Save state (per-request)
         self._block_hashes: dict[str, tuple[bytes, ...]] = {}
@@ -111,11 +116,13 @@ class SchedulerConnector:
             )
             self._pending_load_intents[req_id] = load_intent
             logger.info(
-                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d load_tokens=%d",
+                "[PegaKVConnector] req=%s alloc: total_blocks=%d load_blocks=%d "
+                "load_tokens=%d pending_loads=%d",
                 req_id,
                 len(block_ids),
                 len(load_intent.block_ids),
                 load_intent.num_tokens,
+                len(self._pending_load_intents),
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
@@ -287,6 +294,12 @@ class SchedulerConnector:
                 # Record first time we see loading state
                 if req_id not in self._prefetch_start_times:
                     self._prefetch_start_times[req_id] = time.perf_counter()
+                    self._prefetch_tracker.on_prefetch_start()
+                    logger.info(
+                        "[PegaKVConnector] Prefetch started: req=%s pending_prefetches=%d",
+                        req_id,
+                        self._prefetch_tracker.pending_prefetches,
+                    )
                 return None  # Signal scheduler to retry later
 
             # Prefetch done - log duration if we were tracking
@@ -294,11 +307,15 @@ class SchedulerConnector:
                 prefetch_duration_ms = (
                     time.perf_counter() - self._prefetch_start_times.pop(req_id)
                 ) * 1000
+                self._prefetch_tracker.on_prefetch_complete(prefetch_duration_ms, hit_blocks)
+
                 logger.info(
-                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d prefetch_duration_ms=%.2f",
+                    "[PegaKVConnector] Prefetch completed: req=%s hit_blocks=%d "
+                    "prefetch_duration_ms=%.2f pending_prefetches=%d",
                     req_id,
                     hit_blocks,
                     prefetch_duration_ms,
+                    self._prefetch_tracker.pending_prefetches,
                 )
 
             return hit_blocks
@@ -306,6 +323,23 @@ class SchedulerConnector:
         # Legacy tuple response format (ok, message, hit_blocks)
         _, _, hit_blocks = result
         return hit_blocks
+
+    def get_stats(self) -> PegaKVConnectorStats | None:
+        """Get current connector stats for metrics exposure."""
+        # Get stats from prefetch tracker
+        prefetch_stats = self._prefetch_tracker.get_stats()
+
+        stats = PegaKVConnectorStats(
+            data={
+                "pending_prefetches": prefetch_stats["pending_prefetches"],
+                "prefetch_duration": prefetch_stats["prefetch_duration"],
+                "prefetch_blocks": prefetch_stats["prefetch_blocks"],
+            }
+        )
+
+        if stats.is_empty():
+            return None
+        return stats
 
 
 __all__ = ["SchedulerConnector"]
