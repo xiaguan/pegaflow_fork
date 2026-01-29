@@ -11,6 +11,7 @@ use std::{
 use cudarc::driver::CudaContext;
 use log::info;
 
+use crate::numa::NumaNode;
 use crate::{EngineError, gpu_worker::GpuWorkerPool};
 
 /// Compute greatest common divisor using Euclidean algorithm.
@@ -135,7 +136,14 @@ impl KVCacheRegistration {
 /// - CUDA context lifetime for a specific device
 /// - KV cache registrations for all layers on this GPU
 /// - Asynchronous worker pool for load/save operations
+/// - NUMA affinity for memory allocation optimization
 pub struct GpuContext {
+    /// CUDA device ID.
+    device_id: i32,
+
+    /// Preferred NUMA node for this GPU (for memory allocation).
+    preferred_numa: NumaNode,
+
     /// KV cache layout registrations by layer name.
     kv_caches: Mutex<HashMap<String, KVCacheRegistration>>,
 
@@ -149,17 +157,37 @@ pub struct GpuContext {
 impl GpuContext {
     /// Create a new GPU context for the specified device.
     ///
+    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
+    /// Worker threads will be pinned to the specified NUMA node for optimal
+    /// memory locality during transfers.
+    ///
     /// # Errors
     /// Returns `EngineError::CudaInit` if CUDA context creation or worker
     /// pool initialization fails.
-    pub fn new(cuda_ctx: Arc<CudaContext>, device_id: i32) -> Result<Self, EngineError> {
-        let worker_pool = GpuWorkerPool::spawn(device_id)?;
+    pub fn new(
+        cuda_ctx: Arc<CudaContext>,
+        device_id: i32,
+        numa_node: NumaNode,
+    ) -> Result<Self, EngineError> {
+        let worker_pool = GpuWorkerPool::spawn(device_id, numa_node)?;
 
         Ok(Self {
+            device_id,
+            preferred_numa: numa_node,
             kv_caches: Mutex::new(HashMap::new()),
             _cuda_ctx: cuda_ctx,
             worker_pool,
         })
+    }
+
+    /// Get the preferred NUMA node for this GPU.
+    pub fn preferred_numa(&self) -> NumaNode {
+        self.preferred_numa
+    }
+
+    /// Get the CUDA device ID.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
     }
 
     /// Register a new layer's KV cache layout.
@@ -321,11 +349,16 @@ impl InstanceContext {
     /// Get or create a GPU context for the specified device.
     ///
     /// This method lazily initializes CUDA contexts as devices are first accessed.
+    /// The `numa_node` should be obtained from `NumaTopology::numa_for_gpu()`.
     ///
     /// # Errors
     /// Returns `EngineError::InvalidArgument` for negative device IDs,
     /// or `EngineError::CudaInit` if CUDA context creation fails.
-    pub fn ensure_gpu(&self, device_id: i32) -> Result<Arc<GpuContext>, EngineError> {
+    pub fn ensure_gpu(
+        &self,
+        device_id: i32,
+        numa_node: NumaNode,
+    ) -> Result<Arc<GpuContext>, EngineError> {
         if device_id < 0 {
             return Err(EngineError::InvalidArgument(format!(
                 "device_id {} must be >= 0",
@@ -358,10 +391,13 @@ impl InstanceContext {
         let cuda_ctx = CudaContext::new(device_id as usize)
             .map_err(|e| EngineError::CudaInit(format!("{e:?}")))?;
 
-        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id)?);
+        let ctx = Arc::new(GpuContext::new(cuda_ctx, device_id, numa_node)?);
         contexts.insert(device_id, Arc::clone(&ctx));
 
-        info!("Initialized GPU context: device_id={}", device_id);
+        info!(
+            "Initialized GPU context: device_id={}, numa_node={}",
+            device_id, numa_node
+        );
         Ok(ctx)
     }
 
@@ -387,11 +423,12 @@ impl InstanceContext {
     pub fn register_new_gpu_layer(
         &self,
         device_id: i32,
+        numa_node: NumaNode,
         layer_name: &str,
         registration: KVCacheRegistration,
     ) -> Result<usize, EngineError> {
         // 1. Ensure GPU context
-        let gpu = self.ensure_gpu(device_id)?;
+        let gpu = self.ensure_gpu(device_id, numa_node)?;
 
         // 2. Allocate new layer ID (strict, fails if exists)
         let layer_id = self.allocate_new_layer_id(layer_name).ok_or_else(|| {
@@ -491,6 +528,9 @@ mod tests {
         )
         .expect("create instance");
 
+        // Use UNKNOWN NUMA node for tests (no actual GPU/NUMA in CI)
+        let numa = NumaNode::UNKNOWN;
+
         // 2. Register multiple layers on device 0
         for layer_id in 0..4 {
             let layer_name = format!("layer_{}", layer_id);
@@ -505,7 +545,7 @@ mod tests {
             .unwrap();
 
             let id = instance
-                .register_new_gpu_layer(0, &layer_name, reg)
+                .register_new_gpu_layer(0, numa, &layer_name, reg)
                 .expect("register layer");
             assert_eq!(id, layer_id);
         }
@@ -517,7 +557,7 @@ mod tests {
         // 4. Verify duplicate layer registration fails
         let dup_reg = KVCacheRegistration::new(0x2000, 1024 * 1024, 100, 1024, 0, 1).unwrap();
         let err = instance
-            .register_new_gpu_layer(0, "layer_0", dup_reg)
+            .register_new_gpu_layer(0, numa, "layer_0", dup_reg)
             .expect_err("duplicate should fail");
         assert!(err.to_string().contains("already registered"));
 
