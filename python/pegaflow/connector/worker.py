@@ -324,6 +324,7 @@ class WorkerConnector:
         with self._save_completion_lock:
             for req_id in request_ids:
                 if req_id not in self._req_pending_layers:
+                    # Initialize tracking for new request
                     self._req_pending_layers[req_id] = len(self._registered_layers)
                     self._save_completion_events[req_id] = threading.Event()
 
@@ -342,6 +343,7 @@ class WorkerConnector:
         with self._save_completion_lock:
             pending_layers = set(self._req_pending_layers.keys())
             skipped_requests = self._current_save_intents - pending_layers
+
             if skipped_requests:
                 self._completed_saves.update(skipped_requests)
 
@@ -529,6 +531,10 @@ class WorkerConnector:
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get and reset worker stats for the current interval."""
         with self._stats_lock:
+            # Add current queue depth as gauge
+            with self._save_completion_lock:
+                self._stats.data["pending_save_requests"] = len(self._req_pending_layers)
+
             if self._stats.is_empty():
                 return None
             return self._stats.clone_and_reset()

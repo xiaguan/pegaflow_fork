@@ -72,6 +72,30 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         )
 
 
+def parse_env_int(name: str, default: int) -> int:
+    """Parse an integer from environment variable with fallback to default.
+
+    Note: This function is typically called at module import time for class-level
+    configuration. Changing the environment variable after module import will not
+    affect values that were already read.
+
+    Args:
+        name: Environment variable name.
+        default: Default value if env var is not set or invalid.
+
+    Returns:
+        Parsed integer value or default.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s value '%s', using default %d", name, value, default)
+        return default
+
+
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     """Resolve or generate connector instance_id with optional DP rank suffix."""
     instance_id = vllm_config.kv_transfer_config.engine_id
@@ -134,5 +158,6 @@ __all__ = [
     "SaveIntent",
     "derive_namespace",
     "logger",
+    "parse_env_int",
     "resolve_instance_id",
 ]
