@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::block::{
-    BlockHash, BlockInsertError, BlockKey, InflightBlock, LayerBlock, PrefetchStatus, SealedBlock,
+    BlockInsertError, BlockKey, InflightBlock, LayerBlock, PrefetchStatus, SealedBlock,
 };
 use crate::cache::{CacheInsertOutcome, TinyLfuCache};
 use crate::metrics::core_metrics;
@@ -445,18 +445,21 @@ impl StorageEngine {
         block_hashes: &[Vec<u8>],
         slot_id: usize,
     ) -> Vec<usize> {
-        let mut inner = self.inner.lock().unwrap();
-        block_hashes
+        let keys: Vec<BlockKey> = block_hashes
             .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+
+        let mut inner = self.inner.lock().unwrap();
+        keys.into_iter()
             .enumerate()
-            .filter(|(_, hash)| {
-                let key = BlockKey::new(namespace.to_string(), hash.to_vec());
+            .filter(|(_, key)| {
                 // Skip if already sealed in cache
-                if inner.cache.get(&key).is_some() {
+                if inner.cache.get(key).is_some() {
                     return false;
                 }
                 // Skip if slot already exists in inflight
-                if let Some(block) = inner.inflight.get(&key)
+                if let Some(block) = inner.inflight.get(key)
                     && block.slot_exists(slot_id)
                 {
                     return false;
@@ -467,88 +470,72 @@ impl StorageEngine {
             .collect()
     }
 
-    /// Insert a slot into a block. Handles:
-    /// - Skip if already in cache (sealed)
-    /// - Skip if slot already exists in inflight
-    /// - Create inflight block if needed
-    /// - Seal when complete (but does NOT auto-admit to cache)
-    ///
-    /// Returns:
-    /// - `Ok(None)` if slot was skipped (already exists) or block not yet complete
-    /// - `Ok(Some((key, block)))` if block just completed and was sealed
-    ///
-    /// Caller is responsible for calling `cache_admit` to insert into cache.
-    pub fn insert_slot(
+    /// Batch insert slots and admit sealed blocks in a single lock acquisition.
+    /// Returns all sealed blocks (for SSD write-through).
+    pub fn insert_slots_batch(
         &self,
-        namespace: &str,
-        block_hash: BlockHash,
+        blocks: &[(BlockKey, Arc<LayerBlock>)],
         slot_id: usize,
-        block: Arc<LayerBlock>,
         total_slots: usize,
-    ) -> Result<Option<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
-        let key = BlockKey::new(namespace.to_string(), block_hash);
-
+    ) -> Result<Vec<(BlockKey, Arc<SealedBlock>)>, BlockInsertError> {
         let mut inner = self.inner.lock().unwrap();
+        let mut sealed_blocks: Vec<(BlockKey, Arc<SealedBlock>)> = Vec::new();
 
-        // Fast path: already sealed in cache
-        if inner.cache.contains_key(&key) {
-            return Ok(None);
-        }
+        for (key, block) in blocks {
+            let footprint_bytes = block.memory_footprint();
 
-        // Get or create inflight block
-        let inflight_block = match inner.inflight.entry(key.clone()) {
-            Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
-            Entry::Occupied(o) => o.into_mut(),
-        };
-
-        // Check if slot already exists
-        if inflight_block.slot_exists(slot_id) {
-            return Ok(None);
-        }
-
-        let slot_footprint = block.memory_footprint();
-        let completed = inflight_block.insert_slot(slot_id, block, total_slots)?;
-        record_inflight_bytes_added(slot_footprint);
-
-        if completed {
-            // Remove from inflight and seal
-            let inflight_block = inner.inflight.remove(&key).expect("just checked");
-            let total_footprint = inflight_block.footprint();
-            record_inflight_bytes_removed(total_footprint);
-            let sealed = Arc::new(inflight_block.seal());
-
-            // Notify external consumers (fire-and-forget)
-            drop(inner); // Release lock before sending to channel
-            if let Some(tx) = &self.seal_notify_tx {
-                let _ = tx.send((key.clone(), Arc::downgrade(&sealed)));
+            // Skip if already sealed in cache
+            if inner.cache.contains_key(key) {
+                continue;
             }
 
-            return Ok(Some((key, sealed)));
+            // Get or create inflight block
+            let inflight_block = match inner.inflight.entry(key.clone()) {
+                Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
+                Entry::Occupied(o) => o.into_mut(),
+            };
+
+            // Skip if slot already exists
+            if inflight_block.slot_exists(slot_id) {
+                continue;
+            }
+
+            // Insert slot
+            let completed = inflight_block.insert_slot(slot_id, Arc::clone(block), total_slots)?;
+            record_inflight_bytes_added(footprint_bytes);
+
+            if completed {
+                // Remove from inflight and seal
+                let inflight_block = inner.inflight.remove(key).expect("just checked");
+                let total_footprint = inflight_block.footprint();
+                record_inflight_bytes_removed(total_footprint);
+                let sealed = Arc::new(inflight_block.seal());
+
+                // Try to admit to cache
+                match inner.cache.insert(key.clone(), Arc::clone(&sealed)) {
+                    CacheInsertOutcome::InsertedNew => {
+                        record_cache_insert_new(total_footprint);
+                    }
+                    CacheInsertOutcome::AlreadyExists => {}
+                    CacheInsertOutcome::Rejected => {
+                        core_metrics().cache_block_admission_rejections.add(1, &[]);
+                    }
+                }
+
+                sealed_blocks.push((key.clone(), sealed));
+            }
         }
 
-        Ok(None)
-    }
+        drop(inner);
 
-    /// Attempt to admit a sealed block into cache using TinyLFU policy.
-    /// Returns true if admitted, false if rejected.
-    pub fn cache_admit(&self, key: BlockKey, block: Arc<SealedBlock>) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        let footprint_bytes = block.memory_footprint();
-
-        match inner.cache.insert(key, block) {
-            CacheInsertOutcome::InsertedNew => {
-                record_cache_insert_new(footprint_bytes);
-                true
-            }
-            CacheInsertOutcome::AlreadyExists => {
-                // No overwrite, no-op for metrics.
-                true
-            }
-            CacheInsertOutcome::Rejected => {
-                core_metrics().cache_block_admission_rejections.add(1, &[]);
-                false
+        // Notify all sealed blocks
+        if let Some(tx) = &self.seal_notify_tx {
+            for (key, block) in &sealed_blocks {
+                let _ = tx.send((key.clone(), Arc::downgrade(block)));
             }
         }
+
+        Ok(sealed_blocks)
     }
 
     /// Send a batch of sealed blocks to SSD writer for async persistence.
@@ -599,13 +586,15 @@ impl StorageEngine {
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
+        let pin_keys: Vec<(String, BlockKey)> = keys
+            .iter()
+            .map(|key| (instance_id.to_string(), key.clone()))
+            .collect();
 
         let mut inner = self.inner.lock().unwrap();
         let mut result: Vec<Arc<SealedBlock>> = Vec::with_capacity(keys.len());
 
-        for (idx, key) in keys.into_iter().enumerate() {
-            let pin_key = (instance_id.to_string(), key.clone());
-
+        for (idx, (key, pin_key)) in keys.into_iter().zip(pin_keys.into_iter()).enumerate() {
             // Consume pinned_for_load (ref_count -1, remove if 0)
             if let Entry::Occupied(mut entry) = inner.pinned_for_load.entry(pin_key) {
                 let (block, count) = entry.get_mut();
@@ -669,13 +658,15 @@ impl StorageEngine {
             .iter()
             .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
             .collect();
+        let pin_keys: Vec<(String, BlockKey)> = keys
+            .iter()
+            .map(|key| (instance_id.to_string(), key.clone()))
+            .collect();
 
         let mut inner = self.inner.lock().unwrap();
         let mut unpinned = 0usize;
 
-        for key in keys {
-            let pin_key = (instance_id.to_string(), key.clone());
-
+        for (key, pin_key) in keys.into_iter().zip(pin_keys.into_iter()) {
             if let Some((_, count)) = inner.pinned_for_load.get_mut(&pin_key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -835,27 +826,32 @@ impl StorageEngine {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> PrefetchStatus {
+        let keys: Vec<BlockKey> = hashes
+            .iter()
+            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .collect();
+        let instance_id_owned = instance_id.to_string();
+
         let mut hit = 0usize;
         let mut loading = 0usize;
         let mut missing = 0usize;
         let mut to_prefetch: Vec<BlockKey> = Vec::new();
 
+        // Blocks to pin: (key, block, footprint_bytes)
+        let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
+
         {
             let mut inner = self.inner.lock().unwrap();
 
-            let mut cpu_hit_keys: Vec<BlockKey> = Vec::new();
-
-            for hash in hashes {
-                let key = BlockKey::new(namespace.to_string(), hash.clone());
-
+            for key in &keys {
                 // Then check cache
-                if inner.cache.get(&key).is_some() {
+                if let Some(block) = inner.cache.get(key) {
                     hit += 1;
-                    cpu_hit_keys.push(key);
+                    blocks_to_pin.push((key.clone(), Arc::clone(&block), block.memory_footprint()));
                     continue;
                 }
 
-                if inner.prefetching.contains(&key) {
+                if inner.prefetching.contains(key) {
                     loading += 1;
                     continue;
                 }
@@ -867,11 +863,11 @@ impl StorageEngine {
                 }
 
                 // Check SSD index
-                if let Some(entry) = inner.ssd_index.get(&key)
+                if let Some(entry) = inner.ssd_index.get(key)
                     && inner.ssd_tail <= entry.begin
                 {
                     // Block is in SSD, schedule prefetch
-                    to_prefetch.push(key);
+                    to_prefetch.push(key.clone());
                     loading += 1;
                     continue;
                 }
@@ -885,17 +881,15 @@ impl StorageEngine {
             // Pin hit blocks when returning Done (no loading in progress)
             // Increment ref_count by num_workers so each worker can consume the pin once
             if loading == 0 {
-                for key in cpu_hit_keys {
-                    let pin_key = (instance_id.to_string(), key.clone());
-                    let block = inner.cache.get(&key).unwrap();
-                    let footprint_bytes = block.memory_footprint();
+                for (key, block, footprint_bytes) in blocks_to_pin {
+                    let pin_key = (instance_id_owned.clone(), key.clone());
 
                     match inner.pinned_for_load.entry(pin_key) {
                         Entry::Occupied(mut o) => {
                             o.get_mut().1 += num_workers;
                         }
                         Entry::Vacant(v) => {
-                            v.insert((Arc::clone(&block), num_workers));
+                            v.insert((block, num_workers));
                         }
                     }
 
@@ -996,14 +990,17 @@ impl StorageEngine {
 
     /// Called by prefetch worker when a block is loaded from SSD.
     pub fn complete_prefetch(&self, key: BlockKey, block: Option<Arc<SealedBlock>>) {
+        let footprint_bytes = block.as_ref().map(|b| b.memory_footprint());
+
         let mut inner = self.inner.lock().unwrap();
         inner.prefetching.remove(&key);
 
         if let Some(block) = block {
-            let footprint_bytes = block.memory_footprint();
             match inner.cache.insert(key, block) {
                 CacheInsertOutcome::InsertedNew => {
-                    record_cache_insert_new(footprint_bytes);
+                    if let Some(bytes) = footprint_bytes {
+                        record_cache_insert_new(bytes);
+                    }
                 }
                 CacheInsertOutcome::AlreadyExists => {
                     // No overwrite, no-op for metrics.
