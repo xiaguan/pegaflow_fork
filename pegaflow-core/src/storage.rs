@@ -6,7 +6,8 @@
 // Key invariant: Sealing is a one-way gate. Once sealed, a block is immutable.
 //
 // Architecture:
-// - Single Mutex<StorageInner> for all state (inflight, prefetching, cache, ssd_index)
+// - Mutex<StorageInner>: inflight, prefetching, cache, pinned state
+// - RwLock<SsdRingBuffer>: SSD head/tail/index (shared by writer and readers)
 // - Allocator: PinnedMemoryPool for pinned memory allocation
 // - Prefetch worker: background io_uring reads from SSD
 //
@@ -28,8 +29,8 @@ use crate::metrics::core_metrics;
 use crate::numa::NumaNode;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use crate::ssd_cache::{
-    PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdStorageHandle, SsdWriteBatch,
-    ssd_prefetch_loop, ssd_writer_loop,
+    PrefetchBatch, PrefetchRequest, SsdCacheConfig, SsdIndexEntry, SsdRingBuffer, SsdStorageHandle,
+    SsdWriteBatch, ssd_prefetch_loop, ssd_writer_loop,
 };
 
 // ============================================================================
@@ -145,8 +146,6 @@ struct SsdState {
     writer_tx: tokio::sync::mpsc::Sender<SsdWriteBatch>,
     /// Channel to prefetch worker (bounded to limit queue depth)
     prefetch_tx: tokio::sync::mpsc::Sender<PrefetchBatch>,
-    /// Logical head pointer (next write position)
-    head: std::sync::atomic::AtomicU64,
 }
 
 /// Receivers for SSD workers (separated so they can be moved to workers)
@@ -163,23 +162,21 @@ struct StorageInner {
     prefetching: HashSet<BlockKey>,
     /// Read path: sealed blocks available for lookup (TinyLFU admission + LRU eviction)
     cache: TinyLfuCache<BlockKey, Arc<SealedBlock>>,
-    /// SSD cache index (moved from SsdCache for unified locking)
-    ssd_index: HashMap<BlockKey, SsdIndexEntry>,
-    /// Logical tail pointer for SSD ring buffer eviction
-    ssd_tail: u64,
     /// Pinned blocks between query and load (prevents eviction race)
     /// Key: (instance_id, block_key), Value: (block, ref_count)
     pinned_for_load: HashMap<(String, BlockKey), (Arc<SealedBlock>, usize)>,
     /// Aggregated pinned_for_load refcounts by block key (for attribution metrics).
     /// Value: (footprint_bytes, total_refcount)
     pinned_for_load_by_key: HashMap<BlockKey, (u64, usize)>,
+    /// SSD ring buffer: unified head/tail/index (managed via SsdStorageHandle callbacks)
+    ssd_ring: Option<SsdRingBuffer>,
 }
 
 pub struct StorageEngine {
     /// Unified pinned memory allocator (handles both global and NUMA modes)
     allocator: Arc<PinnedAllocator>,
 
-    /// All mutable state under one lock
+    /// All mutable state under one lock (includes ssd_ring)
     inner: Mutex<StorageInner>,
 
     /// Channel to notify consumers when blocks are sealed (for SSD offload)
@@ -238,30 +235,35 @@ impl StorageEngine {
             value_size_hint,
         );
 
+        // Initialize SSD cache if configured (file + io_uring + channels)
+        let (ssd_state, ssd_receivers, ssd_ring) = match config.ssd_cache_config {
+            Some(ssd_cfg) => {
+                let capacity = ssd_cfg.capacity_bytes;
+                match Self::init_ssd_state(ssd_cfg) {
+                    Ok((state, receivers)) => {
+                        let ring = SsdRingBuffer::new(capacity);
+                        (Some(state), Some(receivers), Some(ring))
+                    }
+                    Err(e) => {
+                        error!("Failed to initialize SSD cache: {}", e);
+                        (None, None, None)
+                    }
+                }
+            }
+            None => (None, None, None),
+        };
+
         let inner = Mutex::new(StorageInner {
             inflight: HashMap::new(),
             prefetching: HashSet::new(),
             cache,
-            ssd_index: HashMap::new(),
-            ssd_tail: 0,
             pinned_for_load: HashMap::new(),
             pinned_for_load_by_key: HashMap::new(),
+            ssd_ring,
         });
 
         // Create unbounded channel for seal notifications
         let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
-
-        // Initialize SSD cache if configured (file + io_uring + channels)
-        let (ssd_state, ssd_receivers) = match config.ssd_cache_config {
-            Some(ssd_cfg) => match Self::init_ssd_state(ssd_cfg) {
-                Ok((state, receivers)) => (Some(state), Some(receivers)),
-                Err(e) => {
-                    error!("Failed to initialize SSD cache: {}", e);
-                    (None, None)
-                }
-            },
-            None => (None, None),
-        };
 
         let engine = Arc::new(Self {
             allocator,
@@ -322,7 +324,6 @@ impl StorageEngine {
             io,
             writer_tx,
             prefetch_tx,
-            head: std::sync::atomic::AtomicU64::new(0),
         };
 
         let receivers = SsdReceivers {
@@ -355,14 +356,7 @@ impl StorageEngine {
         let writer_handle = Arc::clone(&handle);
         let writer_io = Arc::clone(&io);
         tokio::spawn(async move {
-            ssd_writer_loop(
-                writer_handle,
-                writer_rx,
-                writer_io,
-                capacity,
-                write_inflight,
-            )
-            .await;
+            ssd_writer_loop(writer_handle, writer_rx, writer_io, write_inflight).await;
         });
 
         // Spawn prefetch task
@@ -384,27 +378,17 @@ impl StorageEngine {
     }
 
     /// Build the SSD storage handle capturing a weak pointer to StorageEngine.
+    /// Used by both writer (prepare, commit) and prefetch worker.
     fn make_ssd_handle(engine: &Arc<Self>) -> Option<Arc<SsdStorageHandle>> {
         engine.ssd_state.as_ref()?;
 
-        let weak = Arc::downgrade(engine);
-        let weak_prune = Weak::clone(&weak);
-        let weak_publish = Weak::clone(&weak);
-        let weak_complete = Weak::clone(&weak);
-        let weak_valid = Weak::clone(&weak);
-        let weak_alloc = Weak::clone(&weak);
+        let weak_complete = Arc::downgrade(engine);
+        let weak_valid = Arc::downgrade(engine);
+        let weak_alloc = Arc::downgrade(engine);
+        let weak_prepare = Arc::downgrade(engine);
+        let weak_commit = Arc::downgrade(engine);
 
         Some(Arc::new(SsdStorageHandle::new(
-            move |new_tail| {
-                if let Some(engine) = weak_prune.upgrade() {
-                    engine.ssd_prune_tail(new_tail);
-                }
-            },
-            move |key, entry, new_head| {
-                if let Some(engine) = weak_publish.upgrade() {
-                    engine.ssd_publish_write(key, entry, new_head);
-                }
-            },
             move |key, block| {
                 if let Some(engine) = weak_complete.upgrade() {
                     engine.complete_prefetch(key, block);
@@ -420,6 +404,27 @@ impl StorageEngine {
                 weak_alloc
                     .upgrade()
                     .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, None))
+            },
+            move |candidates| {
+                weak_prepare
+                    .upgrade()
+                    .map(|engine| {
+                        let mut inner = engine.inner.lock();
+                        inner
+                            .ssd_ring
+                            .as_mut()
+                            .map(|ring| ring.prepare_batch(candidates))
+                            .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
+                    })
+                    .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
+            },
+            move |key, success| {
+                if let Some(engine) = weak_commit.upgrade() {
+                    let mut inner = engine.inner.lock();
+                    if let Some(ring) = inner.ssd_ring.as_mut() {
+                        ring.commit(key, success);
+                    }
+                }
             },
         )))
     }
@@ -904,7 +909,7 @@ impl StorageEngine {
             let mut inner = self.inner.lock();
 
             for key in &keys {
-                // Then check cache
+                // First check cache
                 if let Some(block) = inner.cache.get(key) {
                     hit += 1;
                     blocks_to_pin.push((key.clone(), Arc::clone(&block), block.memory_footprint()));
@@ -922,10 +927,13 @@ impl StorageEngine {
                     break;
                 }
 
-                // Check SSD index
-                if let Some(entry) = inner.ssd_index.get(key)
-                    && inner.ssd_tail <= entry.begin
-                {
+                // Check SSD index (ssd_ring is now in StorageInner)
+                let in_ssd = inner
+                    .ssd_ring
+                    .as_ref()
+                    .is_some_and(|ring| ring.has_valid_entry(key));
+
+                if in_ssd {
                     // Block is in SSD, schedule prefetch
                     to_prefetch.push(key.clone());
                     loading += 1;
@@ -987,11 +995,15 @@ impl StorageEngine {
             None => return,
         };
 
-        // Collect valid entries
+        // Collect valid entries (ssd_ring is now in StorageInner)
         let mut valid_requests: Vec<(BlockKey, SsdIndexEntry)> = Vec::with_capacity(keys.len());
 
         {
             let mut inner = self.inner.lock();
+            let ring = match inner.ssd_ring.as_ref() {
+                Some(r) => r,
+                None => return,
+            };
 
             for key in keys {
                 // Skip if already prefetching
@@ -999,16 +1011,11 @@ impl StorageEngine {
                     continue;
                 }
 
-                // Get SSD index entry
-                let entry = match inner.ssd_index.get(&key) {
+                // Get SSD index entry (includes validity check)
+                let entry = match ring.get(&key) {
                     Some(e) => e.clone(),
                     None => continue,
                 };
-
-                // Check not evicted
-                if inner.ssd_tail > entry.begin {
-                    continue;
-                }
 
                 valid_requests.push((key, entry));
             }
@@ -1072,34 +1079,13 @@ impl StorageEngine {
         }
     }
 
-    /// Update SSD tail pointer and evict stale index entries.
-    /// Called by SSD writer thread before overwriting the ring buffer.
-    pub(crate) fn ssd_prune_tail(&self, new_tail: u64) {
-        let mut inner = self.inner.lock();
-        if new_tail <= inner.ssd_tail {
-            return;
-        }
-        inner.ssd_tail = new_tail;
-
-        // Remove evicted entries from index
-        inner.ssd_index.retain(|_, entry| new_tail <= entry.begin);
-    }
-
     /// Check if a logical SSD offset is still valid (not yet overwritten).
+    /// Used by prefetch worker to validate reads.
     pub(crate) fn is_ssd_offset_valid(&self, begin: u64) -> bool {
         let inner = self.inner.lock();
-        inner.ssd_tail <= begin
-    }
-
-    /// Publish a completed SSD write by updating the index and head pointer.
-    pub(crate) fn ssd_publish_write(&self, key: BlockKey, entry: SsdIndexEntry, new_head: u64) {
-        let mut inner = self.inner.lock();
-        inner.ssd_index.insert(key, entry);
-
-        if let Some(ref ssd_state) = self.ssd_state {
-            ssd_state
-                .head
-                .store(new_head, std::sync::atomic::Ordering::Release);
-        }
+        inner
+            .ssd_ring
+            .as_ref()
+            .is_some_and(|ring| ring.is_offset_valid(begin))
     }
 }
