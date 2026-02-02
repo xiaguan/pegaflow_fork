@@ -67,6 +67,11 @@ pub struct Cli {
     #[arg(long, default_value_t = true)]
     pub disable_lfu_admission: bool,
 
+    /// Enable NUMA-aware memory allocation. On multi-NUMA systems, per-node
+    /// pinned memory pools are created for optimal transfer bandwidth.
+    #[arg(long, default_value_t = true)]
+    pub numa_affinity: bool,
+
     /// Address for Prometheus metrics HTTP endpoint (e.g. 0.0.0.0:9091). Leave empty to disable.
     #[arg(long, default_value = "0.0.0.0:9091")]
     pub metrics_addr: Option<SocketAddr>,
@@ -351,10 +356,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         hint_value_size_bytes: cli.hint_value_size,
         max_prefetch_blocks: cli.max_prefetch_blocks,
         ssd_cache_config,
+        enable_numa_affinity: cli.numa_affinity,
     };
 
     if cli.disable_lfu_admission {
         info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
+    }
+    if !cli.numa_affinity {
+        info!("NUMA-aware memory allocation explicitly disabled");
     }
 
     // Create Tokio runtime early - needed for OTLP metrics gRPC exporter
