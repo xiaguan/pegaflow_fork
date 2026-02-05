@@ -364,6 +364,10 @@ pub(crate) type PrepareBatchFn =
 /// Type alias for commit write callback.
 pub(crate) type CommitWriteFn = Arc<dyn Fn(&BlockKey, bool) + Send + Sync>;
 
+/// Type alias for prefetch allocation callback.
+pub(crate) type AllocatePrefetchFn =
+    Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>;
+
 /// Handle used by SSD workers to interact with storage.
 /// Both writer and prefetcher use callbacks to access StorageInner state.
 pub(crate) struct SsdStorageHandle {
@@ -372,7 +376,7 @@ pub(crate) struct SsdStorageHandle {
     /// Check if a logical offset is still valid (not yet overwritten)
     is_valid: Arc<dyn Fn(u64) -> bool + Send + Sync>,
     /// Allocate pinned memory for prefetch
-    allocate: Arc<dyn Fn(u64, Option<NumaNode>) -> Option<Arc<PinnedAllocation>> + Send + Sync>,
+    allocate: AllocatePrefetchFn,
     /// Prepare batch for SSD write (filter, allocate space, insert Writing)
     prepare: PrepareBatchFn,
     /// Commit write result (success: Writing→Committed, failure: remove)

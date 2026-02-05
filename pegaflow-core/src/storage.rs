@@ -903,6 +903,7 @@ impl StorageEngine {
         let mut loading = 0usize;
         let mut missing = 0usize;
         let mut to_prefetch: Vec<BlockKey> = Vec::new();
+        let mut backpressure_missing = 0usize;
 
         // Blocks to pin: (key, block, footprint_bytes)
         let mut blocks_to_pin: Vec<(BlockKey, Arc<SealedBlock>, u64)> = Vec::new();
@@ -925,7 +926,8 @@ impl StorageEngine {
 
                 // Backpressure: stop scheduling if too many blocks are prefetching
                 if inner.prefetching.len() >= self.max_prefetch_blocks {
-                    missing = hashes.len() - hit - loading;
+                    backpressure_missing = hashes.len() - hit - loading;
+                    missing = backpressure_missing;
                     break;
                 }
 
@@ -974,6 +976,12 @@ impl StorageEngine {
                     }
                 }
             }
+        }
+
+        if backpressure_missing > 0 {
+            core_metrics()
+                .ssd_prefetch_backpressure_blocks
+                .add(backpressure_missing as u64, &[]);
         }
 
         // Trigger prefetch for blocks in SSD (outside lock)
