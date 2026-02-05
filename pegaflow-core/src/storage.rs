@@ -400,12 +400,12 @@ impl StorageEngine {
                     .map(|engine| engine.is_ssd_offset_valid(begin))
                     .unwrap_or(false)
             },
-            move |size| {
+            move |size, numa_node| {
                 weak_alloc
                     .upgrade()
-                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, None))
+                    .and_then(|engine| engine.allocate(NonZeroU64::new(size)?, numa_node))
             },
-            move |candidates| {
+            move |candidates, numa_node| {
                 weak_prepare
                     .upgrade()
                     .map(|engine| {
@@ -413,7 +413,7 @@ impl StorageEngine {
                         inner
                             .ssd_ring
                             .as_mut()
-                            .map(|ring| ring.prepare_batch(candidates))
+                            .map(|ring| ring.prepare_batch(candidates, numa_node))
                             .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
                     })
                     .unwrap_or_else(crate::ssd_cache::PreparedBatch::empty)
@@ -426,6 +426,7 @@ impl StorageEngine {
                     }
                 }
             },
+            engine.is_numa_enabled(),
         )))
     }
 
@@ -606,7 +607,7 @@ impl StorageEngine {
     /// Send a batch of sealed blocks to SSD writer for async persistence.
     /// Called after sealing a batch of blocks from seal_offload.
     /// Drops the batch if write queue is full (backpressure).
-    pub fn send_ssd_batch(&self, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
+    pub fn send_ssd_batch(&self, numa_node: NumaNode, blocks: &[(BlockKey, Arc<SealedBlock>)]) {
         let Some(ref ssd_state) = self.ssd_state else {
             return;
         };
@@ -620,6 +621,7 @@ impl StorageEngine {
                 .iter()
                 .map(|(k, b)| (k.clone(), Arc::downgrade(b)))
                 .collect(),
+            numa_node,
         };
 
         if ssd_state.writer_tx.try_send(batch).is_ok() {
