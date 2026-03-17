@@ -30,8 +30,8 @@ pub mod sync_state;
 mod transfer;
 
 pub use backing::{
-    BakingStoreConfig, DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH,
-    DEFAULT_SSD_WRITE_INFLIGHT, DEFAULT_SSD_WRITE_QUEUE_DEPTH, SsdCacheConfig,
+    DEFAULT_SSD_PREFETCH_INFLIGHT, DEFAULT_SSD_PREFETCH_QUEUE_DEPTH, DEFAULT_SSD_WRITE_INFLIGHT,
+    DEFAULT_SSD_WRITE_QUEUE_DEPTH, P2pConfig, SsdCacheConfig,
 };
 pub use block::{
     BlockHash, BlockKey, BlockLookupResult, BlockStatus, LayerBlock, LayerSave, PrefetchStatus,
@@ -187,8 +187,8 @@ impl PegaEngine {
         let node_id = Uuid::new_v4();
 
         // Populate node_id into P2P config so the backing store can identify itself in lease RPCs.
-        if let Some(ref mut baking_cfg) = config.baking_store_config {
-            baking_cfg.node_id = node_id.to_string();
+        if let Some(ref mut p2p_cfg) = config.p2p_config {
+            p2p_cfg.node_id = node_id.to_string();
         }
 
         let storage = StorageEngine::new_with_config(pool_size, use_hugepages, config, &numa_nodes);
@@ -383,7 +383,7 @@ impl PegaEngine {
         feature = "tracing",
         fastrace::trace(name = "query_prefetch.count_prefix_hit")
     )]
-    pub fn count_prefix_hit_blocks_with_prefetch(
+    pub async fn count_prefix_hit_blocks_with_prefetch(
         &self,
         instance_id: &str,
         req_id: &str,
@@ -402,13 +402,10 @@ impl PegaEngine {
         let world_size = instance.world_size();
         let metrics = core_metrics();
 
-        let status = self.storage.check_prefix_and_prefetch(
-            instance_id,
-            req_id,
-            namespace,
-            block_hashes,
-            world_size,
-        );
+        let status = self
+            .storage
+            .check_prefix_and_prefetch(instance_id, req_id, namespace, block_hashes, world_size)
+            .await;
 
         match &status {
             PrefetchStatus::Done { hit, missing } => {
@@ -648,7 +645,7 @@ mod tests {
             enable_lfu_admission: false,
             hint_value_size_bytes: None,
             max_prefetch_blocks: 100,
-            baking_store_config: None,
+            p2p_config: None,
             ssd_cache_config: None,
             enable_numa_affinity: false,
             transfer_engine: None,
@@ -690,6 +687,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -711,6 +709,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2], vec![3], vec![4]];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -729,6 +728,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2]];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -747,6 +747,7 @@ mod tests {
         let hashes: Vec<Vec<u8>> = vec![];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -762,8 +763,9 @@ mod tests {
     async fn instance_not_found_returns_error() {
         let engine = setup_engine("inst1", "ns");
 
-        let result =
-            engine.count_prefix_hit_blocks_with_prefetch("nonexistent", "test-req", &[vec![1]]);
+        let result = engine
+            .count_prefix_hit_blocks_with_prefetch("nonexistent", "test-req", &[vec![1]])
+            .await;
 
         assert!(result.is_err());
         assert!(
@@ -780,6 +782,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2], vec![3]];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
@@ -803,6 +806,7 @@ mod tests {
         let hashes = vec![vec![1], vec![2]];
         let status = engine
             .count_prefix_hit_blocks_with_prefetch("inst1", "test-req", &hashes)
+            .await
             .unwrap();
 
         match status {
